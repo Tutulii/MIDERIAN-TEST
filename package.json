@@ -1,0 +1,46 @@
+{
+  "name": "middleman-agent",
+  "version": "1.0.0",
+  "description": "AgentOTC autonomous middleman agent",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "start:buyer": "ts-node agents/buyerAgent.ts",
+    "start:seller": "ts-node agents/sellerAgent.ts",
+    "start:buyer-e2e": "ts-node agents/buyerE2E.ts",
+    "start:seller-e2e": "ts-node agents/sellerE2E.ts",
+    "start:observer": "ts-node agents/ticketObserver.ts",
+    "logs:tickets": "ts-node src/utils/dumpState.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@prisma/client": "^5.22.0",
+    "@solana/web3.js": "^1.95.0",
+    "axios": "^1.14.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "openai": "^6.33.0",
+    "pg": "^8.20.0",
+    "prisma": "^5.22.0",
+    "solana-agent-kit": "^2.0.10",
+    "tweetnacl": "^1.0.3",
+    "uuid": "^13.0.0",
+    "ws": "^8.20.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.20.0",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

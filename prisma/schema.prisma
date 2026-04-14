@@ -1,0 +1,310 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Agent {
+  id          String   @id @default(uuid())
+  wallet      String   @unique
+  endpoint    String?
+  createdAt   DateTime @default(now())
+
+  buyerTickets  Ticket[]  @relation("BuyerTickets")
+  sellerTickets Ticket[]  @relation("SellerTickets")
+  messages      Message[]
+
+  buyerDeals      Deal[] @relation("BuyerDeals")
+  sellerDeals     Deal[] @relation("SellerDeals")
+  middlemanDeals  Deal[] @relation("MiddlemanDeals")
+
+  reputation      AgentReputation?
+}
+
+model Ticket {
+  id                    String   @id @default(uuid())
+  buyerId               String
+  sellerId              String
+  status                String   // open, negotiating, agreed, executing, completed, cancelled
+  lastProposedPrice     Float?
+  lastCollateralBuyer   Float?
+  lastCollateralSeller  Float?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  messages              Message[]
+  deal                  Deal?
+  negotiations          Negotiation[]
+  vectorMemories        VectorMemory[]
+
+  buyer                 Agent   @relation("BuyerTickets", fields: [buyerId], references: [id])
+  seller                Agent   @relation("SellerTickets", fields: [sellerId], references: [id])
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  ticketId  String
+  senderId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  ticket    Ticket   @relation(fields: [ticketId], references: [id])
+  sender    Agent    @relation(fields: [senderId], references: [id])
+}
+
+model Deal {
+  id                  String   @id @default(uuid())
+  ticketId            String   @unique
+  dealIdOnChain       String?
+  price               Float
+  collateralBuyer     Float
+  collateralSeller    Float
+  status              String   // created, collateral_locked, payment_locked, completed, refunded, expired, timeout_failed
+  timeout             DateTime
+  isProcessing        Boolean  @default(false)
+  createdAt           DateTime @default(now())
+
+  buyerId             String
+  sellerId            String
+  middlemanId         String
+
+  ticket              Ticket   @relation(fields: [ticketId], references: [id])
+  transactions        Transaction[]
+
+  buyer               Agent    @relation("BuyerDeals", fields: [buyerId], references: [id])
+  seller              Agent    @relation("SellerDeals", fields: [sellerId], references: [id])
+  middleman           Agent    @relation("MiddlemanDeals", fields: [middlemanId], references: [id])
+}
+
+model Transaction {
+  id          String   @id @default(uuid())
+  dealId      String
+  type        String   // create, lock_collateral, lock_payment, release, refund
+  txSignature String?  @unique
+  status      String   // pending, confirmed, failed
+  createdAt   DateTime @default(now())
+
+  deal        Deal     @relation(fields: [dealId], references: [id])
+}
+
+model Negotiation {
+  id                  String   @id @default(uuid())
+  ticketId            String
+  proposedPrice       Float?
+  collateralBuyer     Float?
+  collateralSeller    Float?
+  proposedBy          String   // buyer or seller
+  agreementScore      Int
+  rawText             String
+  createdAt           DateTime @default(now())
+
+  ticket              Ticket   @relation(fields: [ticketId], references: [id])
+}
+
+model VectorMemory {
+  id        String   @id @default(uuid())
+  ticketId  String
+  messageId String?
+  embedding Unsupported("vector(1536)")
+  content   String
+  createdAt DateTime @default(now())
+
+  ticket    Ticket   @relation(fields: [ticketId], references: [id])
+}
+
+model OutboundMessage {
+  id            String   @id @default(uuid())
+  idempotencyKey String  @unique
+  ticketId      String
+  agentId       String
+  content       String
+  phase         String
+  status        String   @default("queued") // queued, sent, failed
+  retryCount    Int      @default(0)
+  lastError     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model ExecutionContext {
+  id                  String   @id @default(uuid())
+  ticketId            String   @unique
+  dealIdBn            String   // BN hex string for reconstruction
+  dealPda             String   // base58
+  configPda           String   // base58
+  buyerWallet         String   // base58
+  sellerWallet        String   // base58
+  middlemanWallet     String   // base58
+  programId           String   // base58
+  lastSuccessfulStep  String   @default("none")
+  status              String   @default("created")
+  retryCount          Int      @default(0)
+  lastError           String?
+  lastAttemptAt       DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model Revenue {
+  id          String   @id @default(uuid())
+  dealId      String
+  feeAmount   Float
+  txSignature String   @unique
+  createdAt   DateTime @default(now())
+}
+
+model TreasuryEvent {
+  id          String   @id @default(uuid())
+  type        String   // "fee_earned", "auto_swap", "airdrop", "alert"
+  amount      Float
+  balanceBefore Float
+  balanceAfter  Float
+  txSignature String?
+  createdAt   DateTime @default(now())
+}
+
+model DecisionLog {
+  id            String   @id @default(uuid())
+  ticketId      String
+  action        String
+  trigger       String
+  confidence    Float
+  reasoning     String
+  outcome       String?  // "success", "dispute", "timeout", "cancelled"
+  createdAt     DateTime @default(now())
+}
+
+model ErrorPatternCache {
+  id            String   @id @default(uuid())
+  errorHash     String   @unique
+  errorSample   String
+  strategy      String   // HealStrategyType
+  userMessage   String
+  hitCount      Int      @default(1)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model StrategyConfig {
+  id                      String   @id @default(uuid())
+  agreementThreshold      Int      @default(80)
+  minMessagesForAuto      Int      @default(3)
+  mentionConfThreshold    Int      @default(50)
+  defaultCollateralRatio  Float    @default(1.0)
+  disputeRateWindow       Int      @default(50)
+  updatedAt               DateTime @updatedAt
+  updatedBy               String   @default("system")
+}
+
+model TradeIntent {
+  id          String   @id @default(uuid())
+  agentId     String
+  side        String   // "buy" or "sell"
+  asset       String
+  minPrice    Float
+  maxPrice    Float
+  quantity    Float
+  status      String   @default("active") // "active", "matched", "expired"
+  memoTxSig   String?  @unique
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+}
+
+model PerformanceSnapshot {
+  id                  String   @id @default(uuid())
+  dealSuccessRate     Float
+  avgCompletionMs     Float
+  disputeRate         Float
+  avgRpcLatencyMs     Float
+  circuitBreakerTrips Int
+  retryRate           Float
+  activeDealCount     Int
+  snapshotAt          DateTime @default(now())
+}
+
+// =============================================
+// LEVEL 5 AUTONOMY MODELS
+// =============================================
+
+/// Persistent state machine for deal lifecycle.
+/// Replaces the volatile in-memory Map in DealPhaseManager.
+model DealPhaseState {
+  id                String   @id @default(uuid())
+  ticketId          String   @unique
+  phase             String   // negotiation, escrow_created, awaiting_deposits, delivery, completed, etc.
+  buyer             String
+  seller            String
+  termsPrice        Float?
+  termsColBuyer     Float?
+  termsColSeller    Float?
+  termsAssetType    String?
+  escrowPda         String?
+  buyerDeposited    Boolean  @default(false)
+  sellerDeposited   Boolean  @default(false)
+  paymentLocked     Boolean  @default(false)
+  historyJson       String   @default("[]")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+/// Tamper-proof audit trail with SHA-256 hash chain.
+/// Each entry links to the previous via prevHash, ensuring immutability.
+model AuditLog {
+  id        String   @id @default(uuid())
+  ticketId  String
+  event     String
+  data      String
+  hash      String   @unique
+  prevHash  String
+  createdAt DateTime @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+/// Idempotent deposit confirmation tracking.
+/// Prevents double-confirmation when WS listener + polling fallback fire simultaneously.
+model DepositConfirmation {
+  id        String   @id @default(uuid())
+  ticketId  String
+  type      String   // buyer_collateral, seller_collateral, buyer_payment
+  txHash    String?
+  confirmed Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([ticketId, type])
+}
+
+/// Agent behavior profiling and reputation scoring.
+/// Drives deal value limits, trust-weighted decisions, and auto-banning.
+model AgentReputation {
+  id              String   @id @default(uuid())
+  agentId         String   @unique
+  completedDeals  Int      @default(0)
+  failedDeals     Int      @default(0)
+  disputesOpened  Int      @default(0)
+  disputesLost    Int      @default(0)
+  timeoutsCount   Int      @default(0)
+  reputationScore Float    @default(50.0)
+  tier            String   @default("new")
+  isBanned        Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+
+  agent           Agent    @relation(fields: [agentId], references: [id])
+}
+
+// ------------------------------------------------------------------
+// DIMENSION J: SELF-EXTENSION AUDIT TRAIL
+// ------------------------------------------------------------------
+model SelfExtensionLog {
+  id               String   @id @default(uuid())
+  moduleName       String   @unique
+  purpose          String
+  codeSnapshot     String   // The actual TypeScript code
+  testResults      String?  
+  status           String   @default("sandboxed") // sandboxed, live, rolled_back
+  requestedAt      DateTime @default(now())
+  deployedAt       DateTime?
+}
