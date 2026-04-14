@@ -62,41 +62,48 @@ async function fetchSolUsdPrice(): Promise<number> {
         return solUsdPrice;
     }
 
-    // Primary: Binance (reliable, no auth required)
-    try {
-        const response = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT");
-        if (!response.ok) throw new Error(`Binance HTTP ${response.status}`);
-        const data = await response.json() as any;
-        const price = parseFloat(data?.price || "0");
+    const updatePrice = (price: number) => {
+        solUsdPrice = price;
+        solPriceLastFetch = now;
+        _oracleFailCount = 0;
+        return price;
+    };
 
-        if (price > 0) {
-            solUsdPrice = price;
-            solPriceLastFetch = now;
-            _oracleFailCount = 0;
-            return price;
-        }
-    } catch (e: any) {
-        _oracleFailCount++;
-        if (_oracleFailCount <= 1 || _oracleFailCount % 10 === 0) {
-            logger.warn("price_oracle_sol_usd_failed", { source: "binance", error: e.message, consecutive_failures: _oracleFailCount });
-        }
-    }
-
-    // Fallback: CoinGecko
+    // Primary: CoinGecko (Public, Rate Limited)
     try {
         const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
         if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
         const data = await response.json() as any;
         const price = data?.solana?.usd || 0;
-        if (price > 0) {
-            solUsdPrice = price;
-            solPriceLastFetch = now;
-            _oracleFailCount = 0;
-            return price;
-        }
+        if (price > 0) return updatePrice(price);
     } catch (e: any) {
-        if (_oracleFailCount <= 1) {
-            logger.warn("price_oracle_sol_usd_failed", { source: "coingecko", error: e.message });
+        logger.debug("oracle_fallback", { source: "coingecko", error: e.message });
+    }
+
+    // Fallback 1: Birdeye (Requires key or uses public tier)
+    try {
+        const response = await fetch("https://public-api.birdeye.so/defi/price?address=So11111111111111111111111111111111111111112", {
+            headers: { 'X-API-KEY': process.env.BIRDEYE_API_KEY || '' }
+        });
+        if (!response.ok) throw new Error(`Birdeye HTTP ${response.status}`);
+        const data = await response.json() as any;
+        const price = data?.data?.value || 0;
+        if (price > 0) return updatePrice(price);
+    } catch (e: any) {
+        logger.debug("oracle_fallback", { source: "birdeye", error: e.message });
+    }
+
+    // Fallback 2: GeckoTerminal (DEX Aggregated, permissive)
+    try {
+        const response = await fetch("https://api.geckoterminal.com/api/v2/networks/solana/tokens/So11111111111111111111111111111111111111112");
+        if (!response.ok) throw new Error(`GeckoTerminal HTTP ${response.status}`);
+        const data = await response.json() as any;
+        const price = parseFloat(data?.data?.attributes?.price_usd || "0");
+        if (price > 0) return updatePrice(price);
+    } catch (e: any) {
+        _oracleFailCount++;
+        if (_oracleFailCount <= 1 || _oracleFailCount % 10 === 0) {
+            logger.warn("price_oracle_sol_usd_exhausted", { error: e.message, consecutive_failures: _oracleFailCount });
         }
     }
 
