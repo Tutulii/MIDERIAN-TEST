@@ -745,8 +745,10 @@ Output strictly valid JSON with keys: "thought", "currentMood", "internalAnnoyan
 
   // ── Startup complete ──────────────────────────────────────────────
 
-  startWsGateway();
   startRestApi();
+  // Attach WS gateway to the REST HTTP server (shares port for Railway)
+  const { getHttpServer } = await import("./api/restServer");
+  startWsGateway(getHttpServer());
   initAgentMessageListener();
   startHealthServer();
   initObservatoryBridge();

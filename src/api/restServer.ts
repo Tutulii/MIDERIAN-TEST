@@ -11,6 +11,9 @@ import { experienceMemory } from '../services/experienceMemory';
 
 let server: any;
 
+/** Get the underlying HTTP server (used by wsServer to share the same port) */
+export function getHttpServer() { return server; }
+
 // ══════════════════════════════════════
 // HMAC BRIDGE SECURITY
 // Verifies that requests to bridge endpoints come from the API Server.

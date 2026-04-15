@@ -8,8 +8,17 @@ import { walletRegistry } from "../state/walletRegistry";
 
 let wss: WebSocketServer | null = null;
 
-export function startWsGateway(port: number = parseInt(process.env.WS_PORT || "3001")) {
-  wss = new WebSocketServer({ port });
+export function startWsGateway(httpServer?: any) {
+  if (httpServer) {
+    // Cloud mode: attach to existing HTTP server (shares port 8080)
+    wss = new WebSocketServer({ server: httpServer });
+    logger.info("ws_gateway_attached_to_http", { mode: "shared_port" });
+  } else {
+    // Local dev mode: standalone port
+    const port = parseInt(process.env.WS_PORT || "3001");
+    wss = new WebSocketServer({ port });
+    logger.info("ws_gateway_standalone", { port });
+  }
 
   wss.on("connection", (ws: WebSocket, req) => {
     const sessionId = sessionManager.createSession(ws);
@@ -137,7 +146,7 @@ export function startWsGateway(port: number = parseInt(process.env.WS_PORT || "3
     });
   });
 
-  logger.info("ws_gateway_started", { port });
+  logger.info("ws_gateway_started");
 }
 
 export function stopWsGateway(): void {
