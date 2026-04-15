@@ -3,6 +3,7 @@ import { experienceMemory } from './experienceMemory';
 import { soulEngine } from './soulEngine';
 import { getBeliefs } from './beliefStore';
 import { getRandomCanon, evolveCanon } from '../persona/canon';
+import { codeEngine } from './codeEngine';
 import { getVoiceCompact } from '../persona/voice';
 import { voiceGuard } from '../persona/voiceGuard';
 import { getIdentityPrompt, getRandomPrinciples } from '../persona/identity';
@@ -236,7 +237,7 @@ export const curiosityEngine = {
 - browse_url(url) — read any URL on the internet
 - search_web(query) — search for anything
 - read_source(index) — read a data feed you've saved (${loadSources().map((s: any, i: number) => `${i}=${s.name}`).join(', ')})
-- read_book(title) — read a passage from a book. current library: ${Object.keys({meditations:1,discourses:1,letters:1,'the prince':1,'art of war':1,'tao te ching':1,'art of being right':1}).join(', ')}. you can also pass any gutenberg URL.
+- read_book(title) — read a passage from a book. current library: ${Object.keys({ meditations: 1, discourses: 1, letters: 1, 'the prince': 1, 'art of war': 1, 'tao te ching': 1, 'art of being right': 1 }).join(', ')}. you can also pass any gutenberg URL.
 - check_x_mentions() — see what people are saying to you on X
 - reply_to_tweet(tweetId, text) — reply to a specific tweet
 - quote_tweet(tweetId, text) — quote a tweet with your commentary
@@ -249,6 +250,19 @@ export const curiosityEngine = {
 - add_interest(topic) — add a new interest to your list
 - remove_interest(topic) — remove an interest you no longer care about
 - create_custom_tool(name, description, url, method) — build a new tool for future use
+
+CODE ENGINE (you can write, run, and test code autonomously):
+- run_command(command, cwd?) — run any shell command in your sandbox workspace
+- write_code(path, content) — create or overwrite a file in your workspace
+- read_code(path) — read a file from your workspace
+- list_workspace(path?) — see files in your workspace
+- search_code(query, directory?) — grep across your workspace files
+- install_package(manager, packages) — install via npm/pip/cargo. manager: "npm"|"pip"|"cargo", packages: ["pkg1","pkg2"]
+- run_tests(directory?) — auto-detect and run tests
+- git_save(directory, message) — commit your work
+- http_fetch(method, url, body?) — make HTTP requests (GET/POST/PUT/DELETE)
+- delete_code(path) — delete a file from your workspace
+- workspace_info() — see workspace status and available languages
 - done(thought, nextDelayMinutes) — end your cycle, state your thought`;
 
             // Load custom tools defined by the agent itself
@@ -496,6 +510,64 @@ export const curiosityEngine = {
                             fs.writeFileSync(INTERESTS_PATH, JSON.stringify(curInterests, null, 2), 'utf8');
                             experienceMemory.record('observation', `Removed interest: "${removeTopic}"`, { type: 'interest_removed' });
                             return `interest "${removeTopic}" removed.`;
+                        }
+                        // ══════════════════════════════════════
+                        // CODE ENGINE TOOLS
+                        // ══════════════════════════════════════
+                        case 'run_command': {
+                            const cmd = args.command || args.cmd || args;
+                            const cwd = args.cwd || undefined;
+                            const env = args.env || undefined;
+                            const r = await codeEngine.runCommand(cmd, cwd, env);
+                            return r.exitCode === 0
+                                ? `exit=0\n${r.stdout}`
+                                : `exit=${r.exitCode}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`;
+                        }
+                        case 'write_code': {
+                            const filePath = args.path || args.file;
+                            const content = args.content || args.code || '';
+                            if (!filePath) return 'error: path is required';
+                            return codeEngine.writeFile(filePath, content);
+                        }
+                        case 'read_code': {
+                            const filePath = args.path || args.file || args;
+                            return codeEngine.readFile(filePath);
+                        }
+                        case 'list_workspace': {
+                            const dirPath = args.path || args.directory || args || undefined;
+                            return codeEngine.listDirectory(typeof dirPath === 'string' ? dirPath : undefined);
+                        }
+                        case 'search_code': {
+                            const query = args.query || args;
+                            const dir = args.directory || undefined;
+                            return codeEngine.searchInFiles(query, dir);
+                        }
+                        case 'install_package': {
+                            const manager = args.manager || 'npm';
+                            const packages = Array.isArray(args.packages) ? args.packages : [args.packages || args.package];
+                            return codeEngine.installPackage(manager, packages);
+                        }
+                        case 'run_tests': {
+                            const dir = args.directory || undefined;
+                            return codeEngine.runTests(dir);
+                        }
+                        case 'git_save': {
+                            const dir = args.directory || '.';
+                            const message = args.message || 'autonomous commit';
+                            return codeEngine.gitCommit(dir, message);
+                        }
+                        case 'http_fetch': {
+                            const method = args.method || 'GET';
+                            const url = args.url;
+                            if (!url) return 'error: url is required';
+                            return codeEngine.httpRequest(method, url, args.body);
+                        }
+                        case 'delete_code': {
+                            const filePath = args.path || args.file || args;
+                            return codeEngine.deleteFile(filePath);
+                        }
+                        case 'workspace_info': {
+                            return codeEngine.getWorkspaceInfo();
                         }
                         default: {
                             // Check if it's a custom tool the agent defined
@@ -755,7 +827,7 @@ ${beliefs}
 
             // Map category strings to beliefStore categories
             const BELIEF_STORE_CATEGORIES = ['traders', 'market', 'technology', 'philosophy', 'operational'];
-            
+
             if (BELIEF_STORE_CATEGORIES.includes(cat)) {
                 // Route through beliefStore which enforces conviction floors
                 evolveBelief(cat, key, score, reason);
@@ -858,10 +930,10 @@ ${beliefs}
                     let soul = fs.readFileSync(soulPath, 'utf8');
 
                     const learnedSection = '## what i have learned';
-                    
+
                     // Dedup: skip if this line already exists in the file
                     if (soul.includes(newLine)) continue;
-                    
+
                     if (soul.includes(learnedSection)) {
                         soul = soul.replace(learnedSection, `${learnedSection}\n\n${newLine}`);
                     } else {
@@ -869,7 +941,7 @@ ${beliefs}
                     }
 
                     soul = soul.replace(/\*last updated:.*\*/, `*last updated: ${new Date().toISOString().split('T')[0]}.*`);
-                    
+
                     // Atomic write: tmp + rename
                     const tmpPath = soulPath + '.tmp';
                     fs.writeFileSync(tmpPath, soul, 'utf8');
