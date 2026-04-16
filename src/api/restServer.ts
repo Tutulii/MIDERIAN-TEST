@@ -8,6 +8,28 @@ import { analyzeMessage } from '../../core/middlemanBrain';
 import { negotiationStore } from '../state/negotiationStore';
 import { getBeliefs } from '../services/beliefStore';
 import { experienceMemory } from '../services/experienceMemory';
+import {
+    computeTermsHash,
+    generateNonce,
+    verifyTermsHash,
+    storePrivateTerms,
+    getPrivateTerms,
+    getPrivacyStatus,
+    type PrivacyTerms,
+} from '../services/privacyService';
+import { logDrain, type LogEntry } from '../utils/logger';
+import { telemetryService } from '../services/telemetryService';
+import { rpcHealthTracker } from '../services/rpcHealthTracker';
+import { offerScanner, type ScanCriteria } from '../services/offerScanner';
+import { getTokenPrice, checkPriceDeviation, startPriceOracle } from '../services/priceOracle';
+import { solanaToolkit } from '../services/solanaToolkit';
+import * as approvalService from '../services/approvalService';
+import * as relationshipStore from '../services/relationshipStore';
+import * as goalManager from '../services/goalManager';
+import * as taskPipeline from '../services/taskPipeline';
+import { analyzeImage } from '../services/visionEngine';
+import { generateImage } from '../services/imageGenerator';
+import * as scheduler from '../services/schedulerService';
 
 let server: any;
 
@@ -148,7 +170,7 @@ export function startRestApi(port: number = parseInt(process.env.API_PORT || "80
     // ══════════════════════════════════════════════════════════════
     app.post('/v1/deals/create-matched', verifyBridgeHmac, bridgeRateLimiter, async (req, res) => {
         try {
-            const { buyerWallet, sellerWallet, asset, price, amount, collateral, externalTicketId } = req.body;
+            const { buyerWallet, sellerWallet, asset, price, amount, collateral, externalTicketId, tokenMint, decimals } = req.body;
 
             if (!buyerWallet || !sellerWallet) {
                 res.status(400).json({ error: "Both buyerWallet and sellerWallet are required" });
@@ -179,6 +201,8 @@ export function startRestApi(port: number = parseInt(process.env.API_PORT || "80
                 offer_id: externalTicketId || '',
                 buyer: buyerWallet,
                 seller: sellerWallet,
+                tokenMint,
+                decimals: decimals ? parseInt(decimals) : undefined,
                 status: "active",
                 created_at: new Date().toISOString()
             });
@@ -212,13 +236,13 @@ export function startRestApi(port: number = parseInt(process.env.API_PORT || "80
                 timestamp: new Date().toISOString()
             });
 
-            logger.info("matched_deal_created", { 
+            logger.info("matched_deal_created", {
                 ticketId, buyerWallet, sellerWallet, asset, price: parsedPrice,
-                externalTicketId 
+                externalTicketId
             });
 
-            res.status(201).json({ 
-                ticketId, 
+            res.status(201).json({
+                ticketId,
                 status: "matched",
                 buyer: buyerWallet,
                 seller: sellerWallet,
@@ -768,6 +792,749 @@ export function startRestApi(port: number = parseInt(process.env.API_PORT || "80
             res.json({ success: false, error: e.message, results: [] });
         }
     });
+
+    // ══════════════════════════════════════
+    // OBSERVABILITY & MONITORING (Day 24)
+    // ══════════════════════════════════════
+
+    /**
+     * GET /v1/logs/stream (Server-Sent Events)
+     * Real-time log stream from the ring buffer.
+     * Query: ?level=error,warn to filter by level.
+     */
+    app.get('/v1/logs/stream', (req, res) => {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+        });
+
+        // Send recent history first
+        const levelFilter = req.query.level
+            ? (req.query.level as string).split(',')
+            : null;
+
+        const recent = logDrain.getRecent(30);
+        for (const entry of recent) {
+            if (!levelFilter || levelFilter.includes(entry.level)) {
+                res.write(`data: ${JSON.stringify(entry)}\n\n`);
+            }
+        }
+
+        // Subscribe to new entries
+        const unsubscribe = logDrain.subscribe((entry: LogEntry) => {
+            if (!levelFilter || levelFilter.includes(entry.level)) {
+                res.write(`data: ${JSON.stringify(entry)}\n\n`);
+            }
+        });
+
+        // Heartbeat every 15s to keep connection alive
+        const heartbeat = setInterval(() => {
+            res.write(': heartbeat\n\n');
+        }, 15000);
+
+        req.on('close', () => {
+            unsubscribe();
+            clearInterval(heartbeat);
+        });
+    });
+
+    /**
+     * GET /v1/logs/recent
+     * Returns recent log entries from the ring buffer (non-streaming).
+     * Query: ?count=50&level=error,warn
+     */
+    app.get('/v1/logs/recent', (req, res) => {
+        const count = parseInt(req.query.count as string || '50', 10);
+        const levelFilter = req.query.level
+            ? (req.query.level as string).split(',')
+            : null;
+
+        let logs = logDrain.getRecent(count);
+        if (levelFilter) {
+            logs = logs.filter(l => levelFilter.includes(l.level));
+        }
+        res.json({ success: true, count: logs.length, logs });
+    });
+
+    /**
+     * GET /v1/metrics
+     * Agent telemetry: deals/hour, avg settlement time, failure rate, etc.
+     */
+    app.get('/v1/metrics', async (_req, res) => {
+        try {
+            const snapshot = await telemetryService.getSnapshot();
+            res.json({ success: true, ...snapshot });
+        } catch (e: any) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    /**
+     * GET /v1/health/rpc
+     * Solana RPC connection health: per-method latency, error rates, P95.
+     */
+    app.get('/v1/health/rpc', (_req, res) => {
+        const snapshot = rpcHealthTracker.getSnapshot();
+        res.json({ success: true, ...snapshot });
+    });
+
+    // ══════════════════════════════════════
+    // ZK PRIVACY MODE ENDPOINTS (Day 23)
+    // ══════════════════════════════════════
+
+    /**
+     * GET /v1/deals/:id/privacy-status
+     * Returns the privacy mode status of a deal.
+     */
+    app.get('/v1/deals/:id/privacy-status', async (req, res) => {
+        try {
+            const status = await getPrivacyStatus(req.params.id);
+            res.json({ success: true, ...status });
+        } catch (e: any) {
+            logger.error('privacy_status_failed', { id: req.params.id }, e);
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    /**
+     * POST /v1/deals/:id/commit-terms
+     * Compute and store a SHA-256 hash commitment for a privacy-mode deal.
+     * Body: { price, collateral_buyer, collateral_seller, asset_type }
+     */
+    app.post('/v1/deals/:id/commit-terms', async (req, res) => {
+        try {
+            const { price, collateral_buyer, collateral_seller, asset_type } = req.body;
+            if (!price || !collateral_buyer || !collateral_seller || !asset_type) {
+                return res.status(400).json({ success: false, error: 'Missing required fields' });
+            }
+
+            const terms: PrivacyTerms = { price, collateral_buyer, collateral_seller, asset_type };
+            const nonce = generateNonce();
+            const commitment = computeTermsHash(terms, nonce);
+
+            await storePrivateTerms(req.params.id, terms, commitment);
+
+            logger.info('privacy_terms_committed', {
+                ticket_id: req.params.id,
+                terms_hash_preview: commitment.termsHash.substring(0, 16) + '...',
+            });
+
+            res.json({
+                success: true,
+                termsHash: commitment.termsHash,
+                // Return the raw 32-byte array for on-chain use
+                termsHashBytes: Array.from(commitment.termsHashBytes),
+                nonce: commitment.nonce,
+            });
+        } catch (e: any) {
+            logger.error('privacy_commit_failed', { id: req.params.id }, e);
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    /**
+     * POST /v1/deals/:id/reveal-terms
+     * Reveal and verify terms against the stored hash commitment.
+     * Body: { price, collateral_buyer, collateral_seller, asset_type, nonce }
+     */
+    app.post('/v1/deals/:id/reveal-terms', async (req, res) => {
+        try {
+            const { price, collateral_buyer, collateral_seller, asset_type, nonce } = req.body;
+            if (!price || !collateral_buyer || !collateral_seller || !asset_type || !nonce) {
+                return res.status(400).json({ success: false, error: 'Missing required fields (include nonce)' });
+            }
+
+            // Fetch the stored commitment
+            const stored = await getPrivateTerms(req.params.id);
+            if (!stored) {
+                return res.status(404).json({ success: false, error: 'No privacy terms found for this deal' });
+            }
+            if (stored.termsRevealed) {
+                return res.status(409).json({ success: false, error: 'Terms already revealed — double reveal prevented' });
+            }
+
+            // Verify
+            const terms: PrivacyTerms = { price, collateral_buyer, collateral_seller, asset_type };
+            const verified = verifyTermsHash(terms, nonce, stored.termsHash);
+
+            if (!verified) {
+                logger.warn('privacy_reveal_mismatch', { ticket_id: req.params.id });
+                return res.status(400).json({ success: false, error: 'Hash mismatch — revealed terms do not match commitment' });
+            }
+
+            // Mark as revealed in the DB
+            const { prisma: db } = await import('../lib/prisma');
+            await db.deal.update({
+                where: { id: req.params.id },
+                data: { termsRevealed: true },
+            });
+
+            logger.info('privacy_terms_revealed', { ticket_id: req.params.id, verified: true });
+
+            res.json({
+                success: true,
+                verified: true,
+                revealedTerms: { price, collateral_buyer, collateral_seller, asset_type },
+            });
+        } catch (e: any) {
+            logger.error('privacy_reveal_failed', { id: req.params.id }, e);
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    // ══════════════════════════════════════
+    // SIMULATE DEAL (Day 25 — Demo Mode)
+    // ══════════════════════════════════════
+
+    app.post('/v1/simulate/deal', async (_req, res) => {
+        try {
+            const dealId = `SIM-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+            const phases = [
+                { phase: 'created', delay: 0, message: 'Deal created between simulated buyer and seller' },
+                { phase: 'negotiating', delay: 1500, message: 'Middleman analyzing terms...' },
+                { phase: 'agreed', delay: 2500, message: 'Both parties agreed to terms' },
+                { phase: 'wait_escrow', delay: 3500, message: 'Escrow PDA created on-chain' },
+                { phase: 'collateral_locked', delay: 5000, message: 'Both parties deposited collateral' },
+                { phase: 'payment_locked', delay: 6500, message: 'Buyer locked payment' },
+                { phase: 'completed', delay: 8000, message: 'Funds released. Deal settled.' },
+            ];
+
+            // Fire phases asynchronously via eventBus
+            for (const p of phases) {
+                setTimeout(() => {
+                    eventBus.publish('deal_phase_changed' as any, {
+                        ticketId: dealId,
+                        fromPhase: '',
+                        toPhase: p.phase,
+                        message: p.message,
+                        simulated: true,
+                    } as any);
+                    logger.info('simulate_deal_phase', {
+                        deal_id: dealId,
+                        phase: p.phase,
+                        message: p.message,
+                    });
+                }, p.delay);
+            }
+
+            res.json({
+                success: true,
+                dealId,
+                message: 'Simulated deal lifecycle started. Watch events on WebSocket or SSE.',
+                phases: phases.map(p => ({ phase: p.phase, delayMs: p.delay })),
+                totalDurationMs: 8000,
+            });
+        } catch (e: any) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    // ══════════════════════════════════════
+    // OFFER SCANNER (Day 25)
+    // ══════════════════════════════════════
+
+    app.post('/v1/scanner/scan', async (req, res) => {
+        try {
+            const criteria: ScanCriteria[] = req.body.criteria || [req.body];
+            const results = await offerScanner.scanOnce(criteria);
+            res.json({ success: true, matches: results.length, data: results });
+        } catch (e: any) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    app.get('/v1/scanner/status', (_req, res) => {
+        res.json({ success: true, ...offerScanner.getStatus() });
+    });
+
+    app.post('/v1/scanner/start', (req, res) => {
+        const criteria: ScanCriteria[] = req.body.criteria || [];
+        offerScanner.start(criteria);
+        res.json({ success: true, message: `Scanner started with ${criteria.length} criteria` });
+    });
+
+    app.post('/v1/scanner/stop', (_req, res) => {
+        offerScanner.stop();
+        res.json({ success: true, message: 'Scanner stopped' });
+    });
+
+    // ══════════════════════════════════════
+    // PRICE ORACLE (Day 25)
+    // ══════════════════════════════════════
+
+    app.get('/v1/prices/:symbol', async (req, res) => {
+        try {
+            const quote = await getTokenPrice(req.params.symbol);
+            if (!quote) {
+                return res.status(404).json({ success: false, error: `No price data for ${req.params.symbol}` });
+            }
+            res.json({ success: true, data: quote });
+        } catch (e: any) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    app.post('/v1/prices/validate', async (req, res) => {
+        try {
+            const { asset, price, quantity } = req.body;
+            if (!asset || !price) {
+                return res.status(400).json({ success: false, error: 'asset and price are required' });
+            }
+            const result = await checkPriceDeviation(asset, price, quantity || 1);
+            if (!result) {
+                return res.status(404).json({ success: false, error: `No market data for ${asset}` });
+            }
+            res.json({ success: true, data: result });
+        } catch (e: any) {
+            res.status(500).json({ success: false, error: e.message });
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // SOLANA AGENT KIT — FULL HYBRID API
+    // All 60+ SAK actions exposed via REST
+    // ═══════════════════════════════════════════════════════════
+
+    /** Generic SAK result handler */
+    const sakHandler = (res: any, result: any) => {
+        if (result.success) {
+            res.json({ success: true, data: result.data });
+        } else {
+            res.status(400).json({ success: false, error: result.error });
+        }
+    };
+
+    // ── TOKEN: READ ──────────────────────────────────────────
+
+    app.get('/v1/solana/price/:mintOrSymbol', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getTokenPrice(req.params.mintOrSymbol));
+    });
+
+    app.get('/v1/solana/balance/:mintOrSymbol?', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getBalance(req.params.mintOrSymbol));
+    });
+
+    app.get('/v1/solana/token-data/:mintOrSymbol', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getTokenData(req.params.mintOrSymbol));
+    });
+
+    app.get('/v1/solana/rug-check/:mintOrSymbol', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.rugCheck(req.params.mintOrSymbol));
+    });
+
+    app.get('/v1/solana/wallet', async (_req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getWalletAddress());
+    });
+
+    app.get('/v1/solana/methods', async (_req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.listMethods());
+    });
+
+    // ── TOKEN: WRITE ─────────────────────────────────────────
+
+    app.post('/v1/solana/swap', async (req: any, res: any) => {
+        const { inputMint, outputMint, amount, slippageBps } = req.body;
+        if (!inputMint || !outputMint || !amount) return res.status(400).json({ success: false, error: 'inputMint, outputMint, amount required' });
+        sakHandler(res, await solanaToolkit.swapTokens(inputMint, outputMint, Number(amount), Number(slippageBps) || 300));
+    });
+
+    app.post('/v1/solana/transfer', async (req: any, res: any) => {
+        const { to, amount, mint } = req.body;
+        if (!to || !amount) return res.status(400).json({ success: false, error: 'to and amount required' });
+        sakHandler(res, await solanaToolkit.transfer(to, Number(amount), mint));
+    });
+
+    app.post('/v1/solana/stake', async (req: any, res: any) => {
+        const { amount } = req.body;
+        if (!amount) return res.status(400).json({ success: false, error: 'amount required' });
+        sakHandler(res, await solanaToolkit.stakeSOL(Number(amount)));
+    });
+
+    app.post('/v1/solana/burn', async (req: any, res: any) => {
+        const { mint, amount } = req.body;
+        if (!mint || !amount) return res.status(400).json({ success: false, error: 'mint and amount required' });
+        sakHandler(res, await solanaToolkit.burnTokens(mint, Number(amount)));
+    });
+
+    app.post('/v1/solana/close-account', async (req: any, res: any) => {
+        const { mint } = req.body;
+        if (!mint) return res.status(400).json({ success: false, error: 'mint required' });
+        sakHandler(res, await solanaToolkit.closeTokenAccount(mint));
+    });
+
+    app.post('/v1/solana/airdrop', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.requestAirdrop(Number(req.body.amount) || 1));
+    });
+
+    // ── TOKEN: ADMIN ─────────────────────────────────────────
+
+    app.post('/v1/solana/deploy-token', async (req: any, res: any) => {
+        const { name, symbol, uri, decimals, supply } = req.body;
+        if (!name || !symbol) return res.status(400).json({ success: false, error: 'name and symbol required' });
+        sakHandler(res, await solanaToolkit.deployToken(name, symbol, uri, Number(decimals) || 9, Number(supply) || 1000000));
+    });
+
+    app.post('/v1/solana/deploy-token2022', async (req: any, res: any) => {
+        const { name, symbol, uri, decimals, supply } = req.body;
+        if (!name || !symbol) return res.status(400).json({ success: false, error: 'name and symbol required' });
+        sakHandler(res, await solanaToolkit.deployToken2022(name, symbol, uri, Number(decimals) || 9, Number(supply) || 1000000));
+    });
+
+    app.post('/v1/solana/bridge', async (req: any, res: any) => {
+        const { destChain, mint, amount, destAddress } = req.body;
+        if (!destChain || !mint || !amount || !destAddress) return res.status(400).json({ success: false, error: 'destChain, mint, amount, destAddress required' });
+        sakHandler(res, await solanaToolkit.bridgeTokens(destChain, mint, Number(amount), destAddress));
+    });
+
+    app.post('/v1/solana/compressed-airdrop', async (req: any, res: any) => {
+        const { mint, recipients, amounts } = req.body;
+        if (!mint || !recipients || !amounts) return res.status(400).json({ success: false, error: 'mint, recipients, amounts required' });
+        sakHandler(res, await solanaToolkit.compressedAirdrop(mint, recipients, amounts));
+    });
+
+    // ── NFT ──────────────────────────────────────────────────
+
+    app.post('/v1/solana/nft/deploy-collection', async (req: any, res: any) => {
+        const { name, uri, royaltyBps } = req.body;
+        if (!name || !uri) return res.status(400).json({ success: false, error: 'name and uri required' });
+        sakHandler(res, await solanaToolkit.deployNFTCollection(name, uri, Number(royaltyBps) || 500));
+    });
+
+    app.post('/v1/solana/nft/mint', async (req: any, res: any) => {
+        const { collectionMint, name, uri } = req.body;
+        if (!collectionMint || !name || !uri) return res.status(400).json({ success: false, error: 'collectionMint, name, uri required' });
+        sakHandler(res, await solanaToolkit.mintNFT(collectionMint, name, uri));
+    });
+
+    app.post('/v1/solana/nft/3land-collection', async (req: any, res: any) => {
+        const { name, symbol, description, imageUrl, isDevnet } = req.body;
+        if (!name) return res.status(400).json({ success: false, error: 'name required' });
+        sakHandler(res, await solanaToolkit.create3LandCollection({ name, symbol, description, imageUrl }, isDevnet !== false));
+    });
+
+    app.post('/v1/solana/nft/3land-mint', async (req: any, res: any) => {
+        const { collectionAccount, options, isDevnet } = req.body;
+        if (!collectionAccount || !options) return res.status(400).json({ success: false, error: 'collectionAccount and options required' });
+        sakHandler(res, await solanaToolkit.create3LandNFT(collectionAccount, options, isDevnet !== false));
+    });
+
+    // ── DEFI ─────────────────────────────────────────────────
+
+    app.post('/v1/solana/defi/lend', async (req: any, res: any) => {
+        const { amount, mint } = req.body;
+        if (!amount) return res.status(400).json({ success: false, error: 'amount required' });
+        sakHandler(res, await solanaToolkit.lendAssets(Number(amount), mint));
+    });
+
+    app.post('/v1/solana/defi/raydium-pool', async (req: any, res: any) => {
+        const { mintA, mintB, amountA, amountB } = req.body;
+        if (!mintA || !mintB) return res.status(400).json({ success: false, error: 'mintA, mintB, amountA, amountB required' });
+        sakHandler(res, await solanaToolkit.createRaydiumPool(mintA, mintB, Number(amountA), Number(amountB)));
+    });
+
+    app.post('/v1/solana/defi/raydium-clmm', async (req: any, res: any) => {
+        const { mintA, mintB, configId, initialPrice } = req.body;
+        if (!mintA || !mintB || !configId) return res.status(400).json({ success: false, error: 'mintA, mintB, configId, initialPrice required' });
+        sakHandler(res, await solanaToolkit.createRaydiumClmm(mintA, mintB, configId, Number(initialPrice)));
+    });
+
+    app.post('/v1/solana/defi/orca-pool', async (req: any, res: any) => {
+        const { mintA, mintB, initialPrice, feeTier } = req.body;
+        if (!mintA || !mintB) return res.status(400).json({ success: false, error: 'mintA, mintB, initialPrice, feeTier required' });
+        sakHandler(res, await solanaToolkit.createOrcaPool(mintA, mintB, Number(initialPrice), Number(feeTier)));
+    });
+
+    app.post('/v1/solana/defi/meteora-pool', async (req: any, res: any) => {
+        const { mintA, mintB, binStep, initialPrice } = req.body;
+        if (!mintA || !mintB) return res.status(400).json({ success: false, error: 'mintA, mintB, binStep, initialPrice required' });
+        sakHandler(res, await solanaToolkit.createMeteoraPool(mintA, mintB, Number(binStep), Number(initialPrice)));
+    });
+
+    app.post('/v1/solana/defi/openbook-market', async (req: any, res: any) => {
+        const { mintA, mintB, lotSize, tickSize } = req.body;
+        if (!mintA || !mintB) return res.status(400).json({ success: false, error: 'mintA, mintB required' });
+        sakHandler(res, await solanaToolkit.createOpenbookMarket(mintA, mintB, Number(lotSize) || 1, Number(tickSize) || 0.01));
+    });
+
+    app.post('/v1/solana/defi/limit-order', async (req: any, res: any) => {
+        const { mint, quantity, side, price } = req.body;
+        if (!mint || !quantity || !side || !price) return res.status(400).json({ success: false, error: 'mint, quantity, side, price required' });
+        sakHandler(res, await solanaToolkit.createLimitOrder(mint, Number(quantity), side, Number(price)));
+    });
+
+    app.post('/v1/solana/defi/drift-perp', async (req: any, res: any) => {
+        const { amount, symbol, side, leverage } = req.body;
+        if (!amount || !symbol || !side) return res.status(400).json({ success: false, error: 'amount, symbol, side required' });
+        sakHandler(res, await solanaToolkit.openDriftPerp(Number(amount), symbol, side, Number(leverage) || 1));
+    });
+
+    app.post('/v1/solana/defi/drift-deposit', async (req: any, res: any) => {
+        const { amount, symbol } = req.body;
+        if (!amount || !symbol) return res.status(400).json({ success: false, error: 'amount and symbol required' });
+        sakHandler(res, await solanaToolkit.driftDeposit(Number(amount), symbol));
+    });
+
+    app.post('/v1/solana/defi/drift-withdraw', async (req: any, res: any) => {
+        const { amount, symbol } = req.body;
+        if (!amount || !symbol) return res.status(400).json({ success: false, error: 'amount and symbol required' });
+        sakHandler(res, await solanaToolkit.driftWithdraw(Number(amount), symbol));
+    });
+
+    app.post('/v1/solana/defi/adrena-perp', async (req: any, res: any) => {
+        const { amount, symbol, side, leverage } = req.body;
+        if (!amount || !symbol || !side) return res.status(400).json({ success: false, error: 'amount, symbol, side required' });
+        sakHandler(res, await solanaToolkit.openAdrenaPerp(Number(amount), symbol, side, Number(leverage) || 1));
+    });
+
+    app.post('/v1/solana/defi/adrena-close', async (req: any, res: any) => {
+        const { symbol, side } = req.body;
+        if (!symbol || !side) return res.status(400).json({ success: false, error: 'symbol and side required' });
+        sakHandler(res, await solanaToolkit.closeAdrenaPerp(symbol, side));
+    });
+
+    app.post('/v1/solana/defi/jito-bundle', async (req: any, res: any) => {
+        const { transactions } = req.body;
+        if (!transactions) return res.status(400).json({ success: false, error: 'transactions required' });
+        sakHandler(res, await solanaToolkit.sendJitoBundle(transactions));
+    });
+
+    // ── MISC ─────────────────────────────────────────────────
+
+    app.get('/v1/solana/coingecko/:coinId', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getCoinGeckoPrice(req.params.coinId));
+    });
+
+    app.get('/v1/solana/trending', async (_req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getTrendingTokens());
+    });
+
+    app.get('/v1/solana/top-gainers/:duration?', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getTopGainers(req.params.duration || '24h'));
+    });
+
+    app.get('/v1/solana/latest-pools', async (_req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getLatestPools());
+    });
+
+    app.get('/v1/solana/pyth-price/:feedId', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getPythPrice(req.params.feedId));
+    });
+
+    app.get('/v1/solana/resolve-domain/:domain', async (req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.resolveDomain(req.params.domain));
+    });
+
+    app.get('/v1/solana/domain-tlds', async (_req: any, res: any) => {
+        sakHandler(res, await solanaToolkit.getAllDomainsTLDs());
+    });
+
+    app.post('/v1/solana/register-domain', async (req: any, res: any) => {
+        const { domain, space } = req.body;
+        if (!domain) return res.status(400).json({ success: false, error: 'domain required' });
+        sakHandler(res, await solanaToolkit.registerDomain(domain, Number(space) || 1000));
+    });
+
+    app.post('/v1/solana/register-alldomain', async (req: any, res: any) => {
+        const { domain, tld } = req.body;
+        if (!domain || !tld) return res.status(400).json({ success: false, error: 'domain and tld required' });
+        sakHandler(res, await solanaToolkit.registerAlldomains(domain, tld));
+    });
+
+    app.post('/v1/solana/gibwork-bounty', async (req: any, res: any) => {
+        const { title, description, requirements, tags, payout } = req.body;
+        if (!title || !description) return res.status(400).json({ success: false, error: 'title and description required' });
+        sakHandler(res, await solanaToolkit.createGibWorkBounty(title, description, requirements || '', tags || [], Number(payout) || 0));
+    });
+
+    // ── BLINKS ───────────────────────────────────────────────
+
+    app.post('/v1/solana/blink', async (req: any, res: any) => {
+        const { url } = req.body;
+        if (!url) return res.status(400).json({ success: false, error: 'url required' });
+        sakHandler(res, await solanaToolkit.executeBlink(url));
+    });
+
+    // ── CROSS-CHAIN ──────────────────────────────────────────
+
+    app.post('/v1/solana/debridge', async (req: any, res: any) => {
+        const { srcChain, dstChain, srcToken, dstToken, amount } = req.body;
+        if (!srcChain || !dstChain || !srcToken || !dstToken || !amount) {
+            return res.status(400).json({ success: false, error: 'srcChain, dstChain, srcToken, dstToken, amount required' });
+        }
+        sakHandler(res, await solanaToolkit.deBridge(Number(srcChain), Number(dstChain), srcToken, dstToken, Number(amount)));
+    });
+
+    // ── GENERIC ESCAPE HATCH ─────────────────────────────────
+
+    app.post('/v1/solana/call', async (req: any, res: any) => {
+        const { method, args } = req.body;
+        if (!method) return res.status(400).json({ success: false, error: 'method required' });
+        sakHandler(res, await solanaToolkit.callMethod(method, ...(args || [])));
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // APPROVAL SYSTEM
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/approvals/pending', async (_req: any, res: any) => {
+        res.json({ success: true, data: approvalService.listPending() });
+    });
+
+    app.get('/v1/approvals/history', async (req: any, res: any) => {
+        const limit = parseInt(req.query.limit || '50', 10);
+        res.json({ success: true, data: approvalService.getHistory(limit) });
+    });
+
+    app.post('/v1/approvals/:id/approve', async (req: any, res: any) => {
+        const ok = approvalService.approve(req.params.id, req.body.decidedBy || 'api');
+        res.json({ success: ok });
+    });
+
+    app.post('/v1/approvals/:id/reject', async (req: any, res: any) => {
+        const ok = approvalService.reject(req.params.id, req.body.decidedBy || 'api');
+        res.json({ success: ok });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // RELATIONSHIP & TRUST
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/relationships', async (_req: any, res: any) => {
+        res.json({ success: true, data: relationshipStore.getAllRelationships() });
+    });
+
+    app.get('/v1/relationships/top', async (req: any, res: any) => {
+        const limit = parseInt(req.query.limit || '10', 10);
+        res.json({ success: true, data: relationshipStore.getTopTrusted(limit) });
+    });
+
+    app.get('/v1/relationships/:agentId', async (req: any, res: any) => {
+        const rel = relationshipStore.getRelationship(req.params.agentId);
+        res.json({ success: true, data: rel });
+    });
+
+    app.get('/v1/relationships/:agentId/summary', async (req: any, res: any) => {
+        res.json({ success: true, data: relationshipStore.getTrustSummary(req.params.agentId) });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // GOAL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/goals', async (_req: any, res: any) => {
+        res.json({ success: true, data: goalManager.getActiveGoals() });
+    });
+
+    app.get('/v1/goals/all', async (_req: any, res: any) => {
+        res.json({ success: true, data: goalManager.getAllGoals() });
+    });
+
+    app.get('/v1/goals/summary', async (_req: any, res: any) => {
+        res.json({ success: true, data: goalManager.getGoalsSummary() });
+    });
+
+    app.post('/v1/goals', async (req: any, res: any) => {
+        const { description, type, target, metrics } = req.body;
+        if (!description) return res.status(400).json({ success: false, error: 'description required' });
+        const goal = goalManager.createGoal(description, type || 'ongoing', { target, metrics });
+        res.json({ success: true, data: goal });
+    });
+
+    app.patch('/v1/goals/:id/progress', async (req: any, res: any) => {
+        const { progress, note } = req.body;
+        const ok = goalManager.updateProgress(req.params.id, Number(progress), note);
+        res.json({ success: ok });
+    });
+
+    app.patch('/v1/goals/:id/metric', async (req: any, res: any) => {
+        const { metric, value } = req.body;
+        if (!metric) return res.status(400).json({ success: false, error: 'metric required' });
+        const ok = goalManager.updateMetric(req.params.id, metric, Number(value));
+        res.json({ success: ok });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // TASK PIPELINES
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/pipelines', async (_req: any, res: any) => {
+        res.json({ success: true, data: taskPipeline.listActivePipelines() });
+    });
+
+    app.get('/v1/pipelines/history', async (req: any, res: any) => {
+        const limit = parseInt(req.query.limit || '20', 10);
+        res.json({ success: true, data: taskPipeline.getPipelineHistory(limit) });
+    });
+
+    app.post('/v1/pipelines/:id/cancel', async (req: any, res: any) => {
+        const ok = taskPipeline.cancelPipeline(req.params.id);
+        res.json({ success: ok });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // VISION & IMAGE GEN
+    // ═══════════════════════════════════════════════════════════
+
+    app.post('/v1/vision/analyze', async (req: any, res: any) => {
+        const { imageUrl, prompt } = req.body;
+        if (!imageUrl) return res.status(400).json({ success: false, error: 'imageUrl required' });
+        const result = await analyzeImage(imageUrl, prompt);
+        res.json(result);
+    });
+
+    app.post('/v1/image/generate', async (req: any, res: any) => {
+        const { prompt, size, quality, style } = req.body;
+        if (!prompt) return res.status(400).json({ success: false, error: 'prompt required' });
+        const result = await generateImage(prompt, { size, quality, style });
+        res.json(result);
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // SCHEDULER / ROUTINES
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/routines', async (_req: any, res: any) => {
+        res.json({ success: true, data: scheduler.getAllRoutines() });
+    });
+
+    app.get('/v1/routines/active', async (_req: any, res: any) => {
+        res.json({ success: true, data: scheduler.getActiveRoutines() });
+    });
+
+    app.get('/v1/routines/summary', async (_req: any, res: any) => {
+        res.json({ success: true, data: scheduler.getScheduleSummary() });
+    });
+
+    app.get('/v1/routines/history', async (req: any, res: any) => {
+        const limit = parseInt(req.query.limit || '50', 10);
+        res.json({ success: true, data: scheduler.getRoutineHistory(limit) });
+    });
+
+    app.post('/v1/routines', async (req: any, res: any) => {
+        const { name, description, frequency, cronHour, cronMinute, cronDayOfWeek, actions, tags, maxRuns } = req.body;
+        if (!name || !frequency) return res.status(400).json({ success: false, error: 'name and frequency required' });
+        const routine = scheduler.createRoutine(name, description || '', frequency, {
+            cronHour, cronMinute, cronDayOfWeek, actions, tags, maxRuns,
+        });
+        res.json({ success: true, data: routine });
+    });
+
+    app.post('/v1/routines/:id/pause', async (req: any, res: any) => {
+        res.json({ success: scheduler.pauseRoutine(req.params.id) });
+    });
+
+    app.post('/v1/routines/:id/resume', async (req: any, res: any) => {
+        res.json({ success: scheduler.resumeRoutine(req.params.id) });
+    });
+
+    app.delete('/v1/routines/:id', async (req: any, res: any) => {
+        res.json({ success: scheduler.deleteRoutine(req.params.id) });
+    });
+
+    // Start price oracle background refresh
+    startPriceOracle();
 
     server = app.listen(port, () => {
         logger.info("rest_api_started", { port });

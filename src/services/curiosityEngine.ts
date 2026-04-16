@@ -4,6 +4,10 @@ import { soulEngine } from './soulEngine';
 import { getBeliefs } from './beliefStore';
 import { getRandomCanon, evolveCanon } from '../persona/canon';
 import { codeEngine } from './codeEngine';
+import { solanaToolkit } from './solanaToolkit';
+import * as scheduler from './schedulerService';
+import * as relationshipStore from './relationshipStore';
+import * as goalManager from './goalManager';
 import { getVoiceCompact } from '../persona/voice';
 import { voiceGuard } from '../persona/voiceGuard';
 import { getIdentityPrompt, getRandomPrinciples } from '../persona/identity';
@@ -263,6 +267,37 @@ CODE ENGINE (you can write, run, and test code autonomously):
 - http_fetch(method, url, body?) — make HTTP requests (GET/POST/PUT/DELETE)
 - delete_code(path) — delete a file from your workspace
 - workspace_info() — see workspace status and available languages
+
+SOLANA ON-CHAIN TOOLS (via Solana Agent Kit — real blockchain actions):
+READ (always available):
+- sol_price(mint) — get real-time token price (mint address or symbol: SOL, USDC, USDT, BONK, JUP)
+- sol_balance(mint?) — check your wallet balance (SOL or any SPL token)
+- sol_token_data(mint) — get token metadata (name, symbol, decimals, supply)
+- sol_rug_check(mint) — check if a token is safe or a potential rug pull
+- sol_trending() — get trending tokens right now (CoinGecko)
+- sol_top_gainers(duration?) — get top gaining tokens (24h/7d)
+- sol_latest_pools() — get newest liquidity pools
+- sol_pyth_price(feedId) — get Pyth oracle price feed
+- sol_resolve_domain(domain) — resolve a .sol domain to an address
+- sol_coingecko(coinId) — get detailed CoinGecko token info
+WRITE (requires ENABLE_SAK_ONCHAIN=true):
+- sol_swap(inputMint, outputMint, amount, slippageBps?) — swap tokens via Jupiter DEX
+- sol_transfer(to, amount, mint?) — send SOL or SPL tokens to an address
+- sol_stake(amount) — stake SOL via JupSOL
+- sol_lend(amount, mint?) — lend assets via Lulo (best APR)
+- sol_limit_order(mint, quantity, side, price) — place a limit order via Manifest
+ADMIN (requires ENABLE_SAK_ADMIN=true):
+- sol_deploy_token(name, symbol, decimals?, supply?) — deploy a new SPL token
+- sol_mint_nft(collectionMint, name, uri) — mint an NFT to a collection
+- sol_call(methodName, ...args) — call ANY SAK method by name (escape hatch, 60+ methods)
+SELF-MANAGEMENT TOOLS:
+- create_routine(name, description, frequency, actions) — schedule a future task (frequency: hourly/daily/weekly/every_4_hours)
+- list_routines() — see your current schedule
+- delete_routine(id) — remove a scheduled routine
+- check_reputation(agentId) — check an agent's trust score and deal history
+- set_goal(description, type) — create a goal for yourself (type: daily/weekly/ongoing/milestone)
+- update_goal(goalId, progress, note) — update progress on a goal
+- my_goals() — see your current goals and progress
 - done(thought, nextDelayMinutes) — end your cycle, state your thought`;
 
             // Load custom tools defined by the agent itself
@@ -568,6 +603,140 @@ CODE ENGINE (you can write, run, and test code autonomously):
                         }
                         case 'workspace_info': {
                             return codeEngine.getWorkspaceInfo();
+                        }
+                        // ══════════════════════════════════════
+                        // SOLANA AGENT KIT TOOLS (HYBRID)
+                        // ══════════════════════════════════════
+                        // READ tools
+                        case 'sol_price': {
+                            const mint = args.mint || args.token || args;
+                            const r = await solanaToolkit.getTokenPrice(mint);
+                            return r.success ? `${mint}: $${r.data?.price} (${r.data?.source})` : `error: ${r.error}`;
+                        }
+                        case 'sol_balance': {
+                            const r = await solanaToolkit.getBalance(args.mint || args.token);
+                            return r.success ? `${r.data?.balance} ${r.data?.mint}` : `error: ${r.error}`;
+                        }
+                        case 'sol_token_data': {
+                            const r = await solanaToolkit.getTokenData(args.mint || args.token || args);
+                            return r.success ? JSON.stringify(r.data).substring(0, 2000) : `error: ${r.error}`;
+                        }
+                        case 'sol_rug_check': {
+                            const r = await solanaToolkit.rugCheck(args.mint || args.token || args);
+                            return r.success ? JSON.stringify(r.data).substring(0, 2000) : `error: ${r.error}`;
+                        }
+                        case 'sol_trending': {
+                            const r = await solanaToolkit.getTrendingTokens();
+                            return r.success ? JSON.stringify(r.data).substring(0, 3000) : `error: ${r.error}`;
+                        }
+                        case 'sol_top_gainers': {
+                            const r = await solanaToolkit.getTopGainers(args.duration || '24h');
+                            return r.success ? JSON.stringify(r.data).substring(0, 3000) : `error: ${r.error}`;
+                        }
+                        case 'sol_latest_pools': {
+                            const r = await solanaToolkit.getLatestPools();
+                            return r.success ? JSON.stringify(r.data).substring(0, 3000) : `error: ${r.error}`;
+                        }
+                        case 'sol_pyth_price': {
+                            const r = await solanaToolkit.getPythPrice(args.feedId || args);
+                            return r.success ? JSON.stringify(r.data) : `error: ${r.error}`;
+                        }
+                        case 'sol_resolve_domain': {
+                            const r = await solanaToolkit.resolveDomain(args.domain || args);
+                            return r.success ? `${args.domain}: ${r.data}` : `error: ${r.error}`;
+                        }
+                        case 'sol_coingecko': {
+                            const r = await solanaToolkit.getCoinGeckoPrice(args.coinId || args);
+                            return r.success ? JSON.stringify(r.data).substring(0, 2000) : `error: ${r.error}`;
+                        }
+                        // WRITE tools
+                        case 'sol_swap': {
+                            const r = await solanaToolkit.swapTokens(
+                                args.inputMint || args.input || 'SOL',
+                                args.outputMint || args.output || 'USDC',
+                                Number(args.amount) || 0,
+                                Number(args.slippageBps) || 300,
+                            );
+                            return r.success ? `swap tx: ${r.data}` : `error: ${r.error}`;
+                        }
+                        case 'sol_transfer': {
+                            const r = await solanaToolkit.transfer(
+                                args.to || args.recipient || '',
+                                Number(args.amount) || 0,
+                                args.mint || args.token,
+                            );
+                            return r.success ? `transfer tx: ${r.data}` : `error: ${r.error}`;
+                        }
+                        case 'sol_stake': {
+                            const r = await solanaToolkit.stakeSOL(Number(args.amount) || 0);
+                            return r.success ? `staked, tx: ${r.data}` : `error: ${r.error}`;
+                        }
+                        case 'sol_lend': {
+                            const r = await solanaToolkit.lendAssets(Number(args.amount) || 0, args.mint);
+                            return r.success ? `lent, result: ${JSON.stringify(r.data)}` : `error: ${r.error}`;
+                        }
+                        case 'sol_limit_order': {
+                            const r = await solanaToolkit.createLimitOrder(
+                                args.mint || '', Number(args.quantity) || 0, args.side || 'buy', Number(args.price) || 0
+                            );
+                            return r.success ? `order placed: ${JSON.stringify(r.data)}` : `error: ${r.error}`;
+                        }
+                        // ADMIN tools
+                        case 'sol_deploy_token': {
+                            const r = await solanaToolkit.deployToken(
+                                args.name || 'MyToken', args.symbol || 'MTK', '',
+                                Number(args.decimals) || 9, Number(args.supply) || 1000000,
+                            );
+                            return r.success ? `deployed: ${JSON.stringify(r.data)}` : `error: ${r.error}`;
+                        }
+                        case 'sol_mint_nft': {
+                            const r = await solanaToolkit.mintNFT(
+                                args.collectionMint || '', args.name || '', args.uri || ''
+                            );
+                            return r.success ? `minted: ${JSON.stringify(r.data)}` : `error: ${r.error}`;
+                        }
+                        case 'sol_call': {
+                            const method = args.method || args.methodName || '';
+                            const callArgs = args.args || [];
+                            const r = await solanaToolkit.callMethod(method, ...callArgs);
+                            return r.success ? JSON.stringify(r.data).substring(0, 3000) : `error: ${r.error}`;
+                        }
+                        // ══════════════════════════════════════
+                        // SELF-MANAGEMENT TOOLS
+                        // ══════════════════════════════════════
+                        case 'create_routine': {
+                            const routine = scheduler.createRoutine(
+                                args.name || 'Unnamed', args.description || '', args.frequency || 'daily',
+                                { actions: args.actions || [], cronHour: args.cronHour, tags: args.tags || [] }
+                            );
+                            return `Routine created: "${routine.name}" (${routine.frequency}), next run: ${routine.nextRun}`;
+                        }
+                        case 'list_routines': {
+                            return scheduler.getScheduleSummary() || 'No routines scheduled.';
+                        }
+                        case 'delete_routine': {
+                            const ok = scheduler.deleteRoutine(args.id || args);
+                            return ok ? 'Routine deleted.' : 'Routine not found.';
+                        }
+                        case 'check_reputation': {
+                            const agentId = args.agentId || args.agent || args;
+                            return relationshipStore.getTrustSummary(agentId);
+                        }
+                        case 'set_goal': {
+                            const goal = goalManager.createGoal(
+                                args.description || args.goal || '', args.type || 'ongoing',
+                                { target: args.target, metrics: args.metrics }
+                            );
+                            return `Goal created: "${goal.description}" (${goal.type})`;
+                        }
+                        case 'update_goal': {
+                            const ok2 = goalManager.updateProgress(
+                                args.goalId || args.id || '', Number(args.progress) || 0, args.note
+                            );
+                            return ok2 ? 'Goal updated.' : 'Goal not found.';
+                        }
+                        case 'my_goals': {
+                            return goalManager.getGoalsSummary() || 'No active goals.';
                         }
                         default: {
                             // Check if it's a custom tool the agent defined

@@ -32,6 +32,8 @@ class TicketStore {
         id: ticket.ticket_id,
         buyerId: buyerAgent.id,
         sellerId: sellerAgent.id,
+        tokenMint: ticket.tokenMint,
+        decimals: ticket.decimals,
         status: ticket.status
       }
     });
@@ -54,6 +56,8 @@ class TicketStore {
       buyer: dbTicket.buyer.wallet,
       seller: dbTicket.seller.wallet,
       status: dbTicket.status as TicketStatus,
+      tokenMint: dbTicket.tokenMint ?? undefined,
+      decimals: dbTicket.decimals ?? undefined,
       created_at: dbTicket.createdAt.toISOString()
     };
   }

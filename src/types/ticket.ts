@@ -13,6 +13,8 @@ export interface Ticket {
   buyer: string;
   seller: string;
   status: TicketStatus;
+  tokenMint?: string;
+  decimals?: number;
   created_at: string;
   deal_phase?: string;
   agreed_terms?: AgreedTerms;

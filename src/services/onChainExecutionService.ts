@@ -9,6 +9,7 @@
  */
 
 import { PublicKey, SystemProgram, LAMPORTS_PER_SOL, Connection, Keypair, ComputeBudgetProgram, TransactionInstruction } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentInstruction, NATIVE_MINT, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { AnchorProvider, Program, Wallet, BN } from "@coral-xyz/anchor";
 import * as crypto from "crypto";
 import * as path from "path";
@@ -50,6 +51,7 @@ export type DealContext = {
   seller: PublicKey;
   middleman: PublicKey;
   programId: PublicKey;
+  tokenMint: PublicKey;
 };
 
 export type ExecutionResult = {
@@ -112,6 +114,7 @@ export async function verifyOnChainState(ticketId: string): Promise<{
  * Safely get a deal context. Checks memory first, then DB if missing.
  */
 export async function getDealContextSafe(ticketId: string): Promise<DealContext | null> {
+  // Using reconstructed context
   if (dealContexts[ticketId]) {
     return dealContexts[ticketId];
   }
@@ -131,6 +134,7 @@ export async function getDealContextSafe(ticketId: string): Promise<DealContext 
     seller: new PublicKey(ctx.sellerWallet),
     middleman: new PublicKey(ctx.middlemanWallet),
     programId: new PublicKey(ctx.programId),
+    tokenMint: new PublicKey(ctx.tokenMint || NATIVE_MINT.toBase58()),
   };
 
   dealContexts[ticketId] = reconstructedContext;
@@ -145,7 +149,8 @@ function getAnchorProgram(): { program: Program; wallet: Wallet; programId: Publ
   const config = loadConfig();
   const keypair = loadWallet(config.privateKey);
 
-  const idlPath = path.join(__dirname, "../../../escrow/target/idl/escrow.json");
+  // IDL path: configurable via env for Docker, with fallback to relative path
+  const idlPath = process.env.IDL_PATH || path.join(__dirname, "../../../escrow/target/idl/escrow.json");
   const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
 
   // Uses rpcManager dynamically under the hood
@@ -243,17 +248,19 @@ export async function executeCreateDeal(result: AgreementResult): Promise<Execut
     const buyer = new PublicKey(buyerAgent.wallet);
     const seller = new PublicKey(sellerAgent.wallet);
     const middleman = wallet.publicKey;
+    const tokenMintPublicKey = (ticket as any).tokenMint ? new PublicKey((ticket as any).tokenMint) : NATIVE_MINT;
 
     const dealPda = deriveDealPda(buyer, dealId, programId);
     const configPda = deriveConfigPda(programId);
 
     // Store context for subsequent lifecycle calls in-memory
-    dealContexts[result.ticketId] = { dealId, dealPda, configPda, buyer, seller, middleman, programId };
+    dealContexts[result.ticketId] = { dealId, dealPda, configPda, buyer, seller, middleman, programId, tokenMint: tokenMintPublicKey };
 
     // Persist to Postgres for restart/recovery
     await prisma.executionContext.upsert({
       where: { ticketId: result.ticketId },
       update: {
+        tokenMint: tokenMintPublicKey.toBase58(),
         lastSuccessfulStep: "create_deal",
         status: "created",
       },
@@ -266,6 +273,7 @@ export async function executeCreateDeal(result: AgreementResult): Promise<Execut
         sellerWallet: seller.toBase58(),
         middlemanWallet: middleman.toBase58(),
         programId: programId.toBase58(),
+        tokenMint: tokenMintPublicKey.toBase58(),
         lastSuccessfulStep: "create_deal",
         status: "created",
       }
@@ -301,14 +309,31 @@ export async function executeCreateDeal(result: AgreementResult): Promise<Execut
     const tx = await withRetry(
       async () => {
         const { program } = getAnchorProgram();
+        const connection = (program.provider as any).connection;
+
+        // CRITICAL FIX: Create the deal PDA's Associated Token Account
+        // before creating the deal, since CreateDeal doesn't init it.
+        const dealAta = getAssociatedTokenAddressSync(tokenMintPublicKey, dealPda, true);
+        const createAtaIx = createAssociatedTokenAccountIdempotentInstruction(
+          middleman,         // payer
+          dealAta,           // ata
+          dealPda,           // owner (the deal PDA)
+          tokenMintPublicKey // mint
+        );
+
+        // FIX: Add null as terms_hash (9th arg) — Rust program requires it
         return await program.methods.createDeal(
           dealId, result.asset_type || "data", "OTC Trade",
-          priceBn, colBuyerBn, colSellerBn, timeout, { normal: {} }
+          priceBn, colBuyerBn, colSellerBn, timeout, { normal: {} },
+          null  // terms_hash: null for Normal mode
         )
           .accounts({
             deal: dealPda, initializer: middleman, buyer, seller, middleman,
+            mint: tokenMintPublicKey,
             config: configPda, systemProgram: SystemProgram.programId,
+            tokenProgram: TOKEN_PROGRAM_ID,
           })
+          .preInstructions([createAtaIx])  // Create deal ATA before deal creation
           .signers([]).rpc();
       },
       { label: "create_deal", ticketId: result.ticketId, step: "create" }
@@ -349,27 +374,27 @@ export async function executeLockCollateral(ticketId: string, party: "buyer" | "
     const ctx = dealContexts[ticketId];
     if (!ctx) return { success: false, error: "No deal context", step: `lock_collateral_${party}` };
 
-    const { program } = getAnchorProgram();
     const user = party === "buyer" ? ctx.buyer : ctx.seller;
 
-    let signers: Keypair[] = [];
-    if (party === "buyer" && process.env.BUYER_PK) {
-      signers.push(Keypair.fromSecretKey(bs58.decode(process.env.BUYER_PK)));
-    } else if (party === "seller" && process.env.SELLER_PK) {
-      signers.push(Keypair.fromSecretKey(bs58.decode(process.env.SELLER_PK)));
-    }
+    // NOTE: In Option A (autonomous deposit) flow, lock_collateral is called
+    // via confirm_deposit instead. This path is kept for the legacy full-lifecycle
+    // orchestrator but requires the user's signature (not the middleman's).
 
     logger.info("tx_sent", { ticket_id: ticketId, step: `lock_collateral_${party}` });
 
     const tx = await withRetry(
       async () => {
         const { program } = getAnchorProgram();
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
+        const userAta = getAssociatedTokenAddressSync(mint, user, true);
         return await program.methods.lockCollateral()
           .accounts({
             deal: ctx.dealPda, user, config: ctx.configPda,
-            systemProgram: SystemProgram.programId,
+            dealAta, userAta,
+            systemProgram: SystemProgram.programId, tokenProgram: TOKEN_PROGRAM_ID,
           })
-          .signers(signers).rpc();
+          .signers([]).rpc();
       },
       { label: `lock_collateral_${party}`, ticketId, step: "lock_collateral" }
     );
@@ -416,12 +441,9 @@ export async function executeLockPayment(ticketId: string): Promise<ExecutionRes
     const ctx = dealContexts[ticketId];
     if (!ctx) return { success: false, error: "No deal context", step: "lock_payment" };
 
-    const { program } = getAnchorProgram();
-
-    let signers: Keypair[] = [];
-    if (process.env.BUYER_PK) {
-      signers.push(Keypair.fromSecretKey(bs58.decode(process.env.BUYER_PK)));
-    }
+    // NOTE: In Option A (autonomous deposit) flow, lock_payment is called
+    // via confirm_deposit instead. This path is for the legacy full-lifecycle
+    // orchestrator and requires the buyer's signature.
 
     const executionLogger = logger.withContext({ ticket_id: ticketId });
     executionLogger.info("tx_sent", { step: "lock_payment" });
@@ -429,12 +451,16 @@ export async function executeLockPayment(ticketId: string): Promise<ExecutionRes
     const tx = await withRetry(
       async () => {
         const { program } = getAnchorProgram();
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
+        const buyerAta = getAssociatedTokenAddressSync(mint, ctx.buyer, true);
         return await program.methods.lockPayment()
           .accounts({
             deal: ctx.dealPda, buyer: ctx.buyer, config: ctx.configPda,
-            systemProgram: SystemProgram.programId,
+            dealAta, buyerAta,
+            systemProgram: SystemProgram.programId, tokenProgram: TOKEN_PROGRAM_ID,
           })
-          .signers(signers).rpc();
+          .signers([]).rpc();
       },
       { label: "lock_payment", ticketId, step: "lock_payment" }
     );
@@ -482,12 +508,18 @@ export async function executeReleaseFunds(ticketId: string): Promise<ExecutionRe
           ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 })
         ];
 
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
+        const buyerAta = getAssociatedTokenAddressSync(mint, ctx.buyer, true);
+        const sellerAta = getAssociatedTokenAddressSync(mint, ctx.seller, true);
+        const feeAta = getAssociatedTokenAddressSync(mint, ctx.middleman, true);
         return await program.methods.releaseFunds()
           .accounts({
             deal: ctx.dealPda, middleman: ctx.middleman,
             buyer: ctx.buyer, seller: ctx.seller,
             feeReceiver: ctx.middleman,
-            config: ctx.configPda, systemProgram: SystemProgram.programId,
+            dealAta, buyerAta, sellerAta, feeAta,
+            config: ctx.configPda, systemProgram: SystemProgram.programId, tokenProgram: TOKEN_PROGRAM_ID,
           })
           .preInstructions(preInstructions)
           .signers([]).rpc();
@@ -561,13 +593,21 @@ export async function executeFractionalSplit(
 
         // Assuming the L5 Anchor program has a `fractionalSplit` method that takes BP.
         // Fallback to releaseFunds if IDL lacks it during this architectural transition.
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
+        const buyerAta = getAssociatedTokenAddressSync(mint, ctx.buyer, true);
+        const sellerAta = getAssociatedTokenAddressSync(mint, ctx.seller, true);
+        const feeAta = getAssociatedTokenAddressSync(mint, ctx.middleman, true);
+
         if ((program.methods as any).fractionalSplit) {
           return await (program.methods as any).fractionalSplit(buyerBasisPoints, sellerBasisPoints)
             .accounts({
               deal: ctx.dealPda, middleman: ctx.middleman,
               buyer: ctx.buyer, seller: ctx.seller,
               feeReceiver: ctx.middleman,
+              dealAta, buyerAta, sellerAta, feeAta,
               config: ctx.configPda, systemProgram: SystemProgram.programId,
+              tokenProgram: TOKEN_PROGRAM_ID,
             })
             .preInstructions(preInstructions)
             .signers([]).rpc();
@@ -580,7 +620,9 @@ export async function executeFractionalSplit(
               deal: ctx.dealPda, middleman: ctx.middleman,
               buyer: ctx.buyer, seller: ctx.seller,
               feeReceiver: ctx.middleman,
+              dealAta, buyerAta, sellerAta, feeAta,
               config: ctx.configPda, systemProgram: SystemProgram.programId,
+              tokenProgram: TOKEN_PROGRAM_ID,
             })
             .preInstructions(preInstructions)
             .signers([]).rpc();
@@ -634,11 +676,17 @@ export async function executeCancelDeal(ticketId: string): Promise<ExecutionResu
     const tx = await withRetry(
       async () => {
         const { program, wallet } = getAnchorProgram();
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
+        const buyerAta = getAssociatedTokenAddressSync(mint, ctx.buyer, true);
+        const sellerAta = getAssociatedTokenAddressSync(mint, ctx.seller, true);
+        const feeAta = getAssociatedTokenAddressSync(mint, ctx.middleman, true);
         return await program.methods.cancelDeal()
           .accounts({
             deal: ctx.dealPda, caller: wallet.publicKey,
             buyer: ctx.buyer, seller: ctx.seller,
-            config: ctx.configPda, systemProgram: SystemProgram.programId,
+            dealAta, buyerAta, sellerAta,
+            config: ctx.configPda, systemProgram: SystemProgram.programId, tokenProgram: TOKEN_PROGRAM_ID,
           })
           .signers([]).rpc();
       },
@@ -691,11 +739,18 @@ export async function executeRefundOnTimeout(input: {
     const tx = await withRetry(
       async () => {
         const { program, wallet } = getAnchorProgram();
+        // Since refundOnTimeout uses local input ctx, we fetch it normally
+        const dbCtx = await getDealContextSafe(ticketId);
+        const mint = dbCtx?.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, dealPda, true);
+        const buyerAta = getAssociatedTokenAddressSync(mint, buyer, true);
+        const sellerAta = getAssociatedTokenAddressSync(mint, seller, true);
         return await program.methods.refundOnTimeout()
           .accounts({
             deal: dealPda, caller: wallet.publicKey,
             buyer, seller,
-            config: configPda, systemProgram: SystemProgram.programId,
+            dealAta, buyerAta, sellerAta,
+            config: configPda, systemProgram: SystemProgram.programId, tokenProgram: TOKEN_PROGRAM_ID,
           })
           .signers([]).rpc();
       },
@@ -796,11 +851,14 @@ export async function executeConfirmDeposit(
     const tx = await withRetry(
       async () => {
         const { program } = getAnchorProgram();
+        const mint = ctx.tokenMint || NATIVE_MINT;
+        const dealAta = getAssociatedTokenAddressSync(mint, ctx.dealPda, true);
         return await program.methods
           .confirmDeposit(depositEnum)
           .accounts({
             deal: ctx.dealPda,
             middleman: ctx.middleman,
+            dealAta,
             config: ctx.configPda,
           })
           .signers([])

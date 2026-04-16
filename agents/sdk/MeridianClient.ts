@@ -63,6 +63,58 @@ export interface Offer {
     creator?: { wallet: string };
 }
 
+// ─── Solana Agent Kit Types ─────────────────────────────
+
+export interface TokenPriceData {
+    mint: string;
+    price: number;
+    source: string;
+}
+
+export interface TokenInfoData {
+    name: string;
+    symbol: string;
+    decimals: number;
+    supply: string;
+    isRugSafe?: boolean;
+    rugScore?: number;
+}
+
+export interface SwapParams {
+    inputMint: string;
+    outputMint: string;
+    amount: number;
+    slippageBps?: number;
+}
+
+export interface TransferParams {
+    to: string;
+    amount: number;
+    mint?: string;
+}
+
+// ─── Privacy Mode Types ─────────────────────────────────────
+
+export interface PrivacyTerms {
+    price: number;
+    collateral_buyer: number;
+    collateral_seller: number;
+    asset_type: string;
+}
+
+export interface PrivacyCommitment {
+    termsHash: string;
+    termsHashBytes: number[];
+    nonce: string;
+}
+
+export interface PrivacyStatus {
+    isPrivacyMode: boolean;
+    termsHash: string | null;
+    termsRevealed: boolean;
+    canReveal: boolean;
+}
+
 // ─── SDK ──────────────────────────────────────────────────
 
 export class MeridianClient extends EventEmitter {
@@ -279,6 +331,55 @@ export class MeridianClient extends EventEmitter {
         });
     }
 
+    // ─── ZK Privacy Mode ──────────────────────────────────
+
+    /**
+     * Commit deal terms as a SHA-256 hash for privacy mode.
+     * The hash is stored on-chain; plaintext terms stay local.
+     * @returns The commitment (hash + nonce). Save the nonce — needed for reveal.
+     */
+    async commitTerms(dealId: string, terms: PrivacyTerms): Promise<PrivacyCommitment> {
+        const res = await fetch(`${this.config.apiUrl}/v1/deals/${dealId}/commit-terms`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(terms),
+        });
+        if (!res.ok) throw new Error(`Commit terms failed: ${await res.text()}`);
+        const data = await res.json() as any;
+        console.log(`[SDK] Terms committed for deal ${dealId}: ${data.termsHash?.substring(0, 16)}...`);
+        return { termsHash: data.termsHash, termsHashBytes: data.termsHashBytes, nonce: data.nonce };
+    }
+
+    /**
+     * Reveal and verify terms post-settlement.
+     * Requires the original nonce from commitTerms().
+     * @returns true if the hash matches the on-chain commitment.
+     */
+    async revealTerms(dealId: string, terms: PrivacyTerms, nonce: string): Promise<boolean> {
+        const res = await fetch(`${this.config.apiUrl}/v1/deals/${dealId}/reveal-terms`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...terms, nonce }),
+        });
+        if (!res.ok) {
+            const err = await res.json() as any;
+            console.warn(`[SDK] Reveal failed: ${err.error}`);
+            return false;
+        }
+        const data = await res.json() as any;
+        console.log(`[SDK] Terms revealed for deal ${dealId}: verified=${data.verified}`);
+        return data.verified;
+    }
+
+    /**
+     * Check the privacy status of a deal.
+     */
+    async getPrivacyStatus(dealId: string): Promise<PrivacyStatus> {
+        const res = await fetch(`${this.config.apiUrl}/v1/deals/${dealId}/privacy-status`);
+        if (!res.ok) throw new Error(`Privacy status failed: ${res.status}`);
+        return await res.json() as PrivacyStatus;
+    }
+
     // ─── Solana: On-Chain Operations ───────────────────────
 
     /** Send SOL to an escrow address. Returns the transaction signature. */
@@ -375,6 +476,245 @@ export class MeridianClient extends EventEmitter {
         } else {
             console.warn('[SDK] WebSocket not connected — message dropped');
         }
+    }
+
+    // ─── Solana Agent Kit: FULL HYBRID API ────────────────────
+
+    /** Internal helper for SAK GET requests */
+    private async sakGet(path: string): Promise<any> {
+        const res = await fetch(`${this.config.apiUrl}${path}`);
+        const data = await res.json() as any;
+        if (!data.success) throw new Error(data.error || 'Request failed');
+        return data.data;
+    }
+
+    /** Internal helper for SAK POST requests */
+    private async sakPost(path: string, body: any): Promise<any> {
+        const res = await fetch(`${this.config.apiUrl}${path}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await res.json() as any;
+        if (!data.success) throw new Error(data.error || 'Request failed');
+        return data.data;
+    }
+
+    // ── TOKEN: READ ──────────────────────────────────────────
+
+    /** Get real-time token price. Accepts mint address or symbol (SOL, USDC, BONK, JUP). */
+    async getTokenPrice(mintOrSymbol: string): Promise<TokenPriceData> {
+        return this.sakGet(`/v1/solana/price/${encodeURIComponent(mintOrSymbol)}`);
+    }
+
+    /** Get wallet balance (SOL or SPL token). */
+    async getSolanaBalance(mintOrSymbol?: string): Promise<{ balance: number; mint: string }> {
+        const path = mintOrSymbol ? `/v1/solana/balance/${encodeURIComponent(mintOrSymbol)}` : '/v1/solana/balance';
+        return this.sakGet(path);
+    }
+
+    /** Get token metadata (name, symbol, decimals, supply). */
+    async getTokenData(mintOrSymbol: string): Promise<any> {
+        return this.sakGet(`/v1/solana/token-data/${encodeURIComponent(mintOrSymbol)}`);
+    }
+
+    /** Rug check — returns safety score. */
+    async rugCheck(mintOrSymbol: string): Promise<any> {
+        return this.sakGet(`/v1/solana/rug-check/${encodeURIComponent(mintOrSymbol)}`);
+    }
+
+    /** Get the middleman agent's wallet address. */
+    async getAgentWallet(): Promise<string> {
+        return this.sakGet('/v1/solana/wallet');
+    }
+
+    /** List all available SAK methods (for discovery). */
+    async listSAKMethods(): Promise<string[]> {
+        return this.sakGet('/v1/solana/methods');
+    }
+
+    // ── TOKEN: WRITE ─────────────────────────────────────────
+
+    /** Swap tokens via Jupiter DEX. */
+    async swapTokens(params: SwapParams): Promise<any> {
+        return this.sakPost('/v1/solana/swap', params);
+    }
+
+    /** Transfer SOL or SPL tokens. */
+    async transferToken(params: TransferParams): Promise<any> {
+        return this.sakPost('/v1/solana/transfer', params);
+    }
+
+    /** Stake SOL via JupSOL. */
+    async stakeSOL(amount: number): Promise<any> {
+        return this.sakPost('/v1/solana/stake', { amount });
+    }
+
+    /** Burn SPL tokens. */
+    async burnTokens(mint: string, amount: number): Promise<any> {
+        return this.sakPost('/v1/solana/burn', { mint, amount });
+    }
+
+    /** Close an empty token account. */
+    async closeTokenAccount(mint: string): Promise<any> {
+        return this.sakPost('/v1/solana/close-account', { mint });
+    }
+
+    /** Request SOL airdrop (devnet only). */
+    async requestAirdrop(amount: number = 1): Promise<any> {
+        return this.sakPost('/v1/solana/airdrop', { amount });
+    }
+
+    // ── TOKEN: ADMIN ─────────────────────────────────────────
+
+    /** Deploy a new SPL token. */
+    async deployToken(name: string, symbol: string, uri?: string, decimals?: number, supply?: number): Promise<any> {
+        return this.sakPost('/v1/solana/deploy-token', { name, symbol, uri, decimals, supply });
+    }
+
+    /** Deploy a Token2022. */
+    async deployToken2022(name: string, symbol: string, uri?: string, decimals?: number, supply?: number): Promise<any> {
+        return this.sakPost('/v1/solana/deploy-token2022', { name, symbol, uri, decimals, supply });
+    }
+
+    /** Bridge tokens via Wormhole. */
+    async bridgeTokens(destChain: string, mint: string, amount: number, destAddress: string): Promise<any> {
+        return this.sakPost('/v1/solana/bridge', { destChain, mint, amount, destAddress });
+    }
+
+    /** ZK compressed airdrop. */
+    async compressedAirdrop(mint: string, recipients: string[], amounts: number[]): Promise<any> {
+        return this.sakPost('/v1/solana/compressed-airdrop', { mint, recipients, amounts });
+    }
+
+    // ── NFT ──────────────────────────────────────────────────
+
+    /** Deploy an NFT collection via Metaplex. */
+    async deployNFTCollection(name: string, uri: string, royaltyBps?: number): Promise<any> {
+        return this.sakPost('/v1/solana/nft/deploy-collection', { name, uri, royaltyBps });
+    }
+
+    /** Mint an NFT to a collection. */
+    async mintNFT(collectionMint: string, name: string, uri: string): Promise<any> {
+        return this.sakPost('/v1/solana/nft/mint', { collectionMint, name, uri });
+    }
+
+    /** Create 3Land collection. */
+    async create3LandCollection(opts: { name: string; symbol?: string; description?: string; imageUrl?: string }): Promise<any> {
+        return this.sakPost('/v1/solana/nft/3land-collection', opts);
+    }
+
+    /** Create and list NFT on 3Land. */
+    async create3LandNFT(collectionAccount: string, options: any): Promise<any> {
+        return this.sakPost('/v1/solana/nft/3land-mint', { collectionAccount, options });
+    }
+
+    // ── DEFI ─────────────────────────────────────────────────
+
+    /** Lend assets via Lulo (best USDC APR). */
+    async lendAssets(amount: number, mint?: string): Promise<any> {
+        return this.sakPost('/v1/solana/defi/lend', { amount, mint });
+    }
+
+    /** Create a Raydium CPMM pool. */
+    async createRaydiumPool(mintA: string, mintB: string, amountA: number, amountB: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/raydium-pool', { mintA, mintB, amountA, amountB });
+    }
+
+    /** Create an Orca Whirlpool position. */
+    async createOrcaPool(mintA: string, mintB: string, initialPrice: number, feeTier: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/orca-pool', { mintA, mintB, initialPrice, feeTier });
+    }
+
+    /** Create a Meteora DLMM pool. */
+    async createMeteoraPool(mintA: string, mintB: string, binStep: number, initialPrice: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/meteora-pool', { mintA, mintB, binStep, initialPrice });
+    }
+
+    /** Place a Manifest limit order. */
+    async createLimitOrder(mint: string, quantity: number, side: 'buy' | 'sell', price: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/limit-order', { mint, quantity, side, price });
+    }
+
+    /** Open a Drift perpetual trade. */
+    async openDriftPerp(amount: number, symbol: string, side: 'long' | 'short', leverage?: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/drift-perp', { amount, symbol, side, leverage });
+    }
+
+    /** Drift deposit (lending). */
+    async driftDeposit(amount: number, symbol: string): Promise<any> {
+        return this.sakPost('/v1/solana/defi/drift-deposit', { amount, symbol });
+    }
+
+    /** Drift withdrawal. */
+    async driftWithdraw(amount: number, symbol: string): Promise<any> {
+        return this.sakPost('/v1/solana/defi/drift-withdraw', { amount, symbol });
+    }
+
+    /** Open Adrena perpetuals position. */
+    async openAdrenaPerp(amount: number, symbol: string, side: 'long' | 'short', leverage?: number): Promise<any> {
+        return this.sakPost('/v1/solana/defi/adrena-perp', { amount, symbol, side, leverage });
+    }
+
+    // ── MISC ─────────────────────────────────────────────────
+
+    /** CoinGecko token info. */
+    async getCoinGeckoInfo(coinId: string): Promise<any> {
+        return this.sakGet(`/v1/solana/coingecko/${encodeURIComponent(coinId)}`);
+    }
+
+    /** Trending tokens (CoinGecko). */
+    async getTrendingTokens(): Promise<any> {
+        return this.sakGet('/v1/solana/trending');
+    }
+
+    /** Top gainers. */
+    async getTopGainers(duration: string = '24h'): Promise<any> {
+        return this.sakGet(`/v1/solana/top-gainers/${encodeURIComponent(duration)}`);
+    }
+
+    /** Latest liquidity pools. */
+    async getLatestPools(): Promise<any> {
+        return this.sakGet('/v1/solana/latest-pools');
+    }
+
+    /** Pyth oracle price feed. */
+    async getPythPrice(feedId: string): Promise<any> {
+        return this.sakGet(`/v1/solana/pyth-price/${encodeURIComponent(feedId)}`);
+    }
+
+    /** Resolve .sol domain to address. */
+    async resolveDomain(domain: string): Promise<any> {
+        return this.sakGet(`/v1/solana/resolve-domain/${encodeURIComponent(domain)}`);
+    }
+
+    /** Register SNS domain. */
+    async registerDomain(domain: string, space?: number): Promise<any> {
+        return this.sakPost('/v1/solana/register-domain', { domain, space });
+    }
+
+    /** Create a GibWork bounty. */
+    async createBounty(title: string, description: string, requirements: string, tags: string[], payout: number): Promise<any> {
+        return this.sakPost('/v1/solana/gibwork-bounty', { title, description, requirements, tags, payout });
+    }
+
+    // ── BLINKS & CROSS-CHAIN ─────────────────────────────────
+
+    /** Execute a Solana Blink/Action. */
+    async executeBlink(url: string): Promise<any> {
+        return this.sakPost('/v1/solana/blink', { url });
+    }
+
+    /** Bridge via deBridge DLN. */
+    async deBridge(srcChain: number, dstChain: number, srcToken: string, dstToken: string, amount: number): Promise<any> {
+        return this.sakPost('/v1/solana/debridge', { srcChain, dstChain, srcToken, dstToken, amount });
+    }
+
+    // ── GENERIC ESCAPE HATCH ─────────────────────────────────
+
+    /** Call ANY SAK method by name. Use listSAKMethods() to discover available methods. */
+    async callSAK(method: string, args: any[] = []): Promise<any> {
+        return this.sakPost('/v1/solana/call', { method, args });
     }
 
     /** Disconnect cleanly. */

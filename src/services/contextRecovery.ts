@@ -49,6 +49,7 @@ export async function recoverInFlightDeals(): Promise<void> {
                     seller: new PublicKey(ctx.sellerWallet),
                     middleman: new PublicKey(ctx.middlemanWallet),
                     programId: new PublicKey(ctx.programId),
+                    tokenMint: new PublicKey(ctx.tokenMint || "So11111111111111111111111111111111111111112"),
                 };
                 dealContexts[ctx.ticketId] = reconstructedContext;
                 contextRecoveredCount++;

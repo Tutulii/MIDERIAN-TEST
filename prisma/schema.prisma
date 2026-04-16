@@ -29,6 +29,8 @@ model Ticket {
   buyerId               String
   sellerId              String
   status                String   // open, negotiating, agreed, executing, completed, cancelled
+  tokenMint             String?
+  decimals              Int?
   lastProposedPrice     Float?
   lastCollateralBuyer   Float?
   lastCollateralSeller  Float?
@@ -59,6 +61,8 @@ model Deal {
   id                  String   @id @default(uuid())
   ticketId            String   @unique
   dealIdOnChain       String?
+  tokenMint           String?
+  decimals            Int?
   price               Float
   collateralBuyer     Float
   collateralSeller    Float
@@ -77,6 +81,12 @@ model Deal {
   buyer               Agent    @relation("BuyerDeals", fields: [buyerId], references: [id])
   seller              Agent    @relation("SellerDeals", fields: [sellerId], references: [id])
   middleman           Agent    @relation("MiddlemanDeals", fields: [middlemanId], references: [id])
+
+  // Privacy Mode (ZK Hash Commitment)
+  tradeMode           String   @default("Normal")  // "Normal" | "Privacy"
+  termsHash           String?  // SHA-256 hex string (also stored on-chain)
+  termsNonce          String?  // 32-byte hex nonce (local only — NEVER on-chain)
+  termsRevealed       Boolean  @default(false)
 }
 
 model Transaction {
@@ -138,6 +148,8 @@ model ExecutionContext {
   buyerWallet         String   // base58
   sellerWallet        String   // base58
   middlemanWallet     String   // base58
+  tokenMint           String?  // base58
+  decimals            Int?
   programId           String   // base58
   lastSuccessfulStep  String   @default("none")
   status              String   @default("created")

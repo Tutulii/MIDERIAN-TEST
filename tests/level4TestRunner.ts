@@ -20,7 +20,7 @@ function section(title: string) {
 
 async function runTest1() {
   section("Test 1: Basic Agreement Detection + Execution (Most Important)");
-  
+
   const ticketId = "TKT-TEST1";
   dealPhaseManager.initDeal(ticketId, "Buyer", "Seller");
 
@@ -42,18 +42,18 @@ async function runTest1() {
 
   for (const act of messages) {
     console.log(`[${act.s}]: ${act.m}`);
-    vectorMemoryStore.addMemory(ticketId, act.s, act.m, "USER");
-    
+    vectorMemoryStore.storeMemory({ ticketId, content: `[${act.s}]: ${act.m}` });
+
     // Process message through Brain
     finalDecision = await analyzeMessage(act.m, act.s, ticketId, signals);
   }
 
   console.log(`\nBrain Evaluation:`);
   console.log(`-> Does agreement_detected fire? Action returned: ${finalDecision.action}`);
-  
+
   if (finalDecision.action === "CREATE_ESCROW") {
     console.log(`-> Brain automatically decided to create escrow based on conversation history!`);
-    
+
     // Simulate what index.ts does: trigger dealPhaseManager
     const result = await dealPhaseManager.handleAction(
       finalDecision.action, ticketId, "middleman", finalDecision.terms
@@ -82,21 +82,21 @@ async function runTest2() {
 
   const ticketId = "TKT-TEST2";
   dealPhaseManager.initDeal(ticketId, "Buyer", "Seller");
-  
+
   // Fake state to disputed
   dealPhaseManager.handleAction("CREATE_ESCROW", ticketId, "Buyer", { price: 5, collateral_buyer: 1, collateral_seller: 1 });
   dealPhaseManager.handleAction("DISPUTE", ticketId, "Buyer");
 
   console.log(`[Buyer]: @middleman seller never delivered`);
-  vectorMemoryStore.addMemory(ticketId, "Buyer", "@middleman seller never delivered", "USER");
-  
+  vectorMemoryStore.storeMemory({ ticketId, content: "[Buyer]: @middleman seller never delivered" });
+
   console.log(`[Seller]: I sent the API key here: https://example.com/key`);
-  vectorMemoryStore.addMemory(ticketId, "Seller", "I sent the API key here: https://example.com/key", "USER");
+  vectorMemoryStore.storeMemory({ ticketId, content: "[Seller]: I sent the API key here: https://example.com/key" });
 
   console.log(`\n-> AI Judge Triggering Arbitrarion...`);
-  
+
   const ctx = vectorMemoryStore.getContextSnapshot(ticketId);
-  const verdict = await adjudicateDispute(ticketId, ctx, { price: 5, collateral_buyer: 1, collateral_seller: 1 });
+  const verdict = await adjudicateDispute(ticketId, { price: 5, collateral_buyer: 1, collateral_seller: 1 });
 
   console.log(`-> Does AI Judge trigger? YES`);
   console.log(`-> AI Verdict Action: ${verdict.action}`);
@@ -109,13 +109,13 @@ async function runTest3() {
 
   console.log(`Forcing Error 1: "Error 0x1: Insufficient funds for rent" on "create_deal"`);
   const heal1 = await interpretExecutionError("create_deal", "Error 0x1: Insufficient funds for rent");
-  
+
   console.log(`-> Auto-Healer Strategy: ${heal1.strategy}`);
   console.log(`-> Auto-Healer Message to User: ${heal1.userMessage}\n`);
 
   console.log(`Forcing Error 2: "Blockhash not found" on "lock_collateral"`);
   const heal2 = await interpretExecutionError("lock_collateral", "Blockhash not found. Network congestion.");
-  
+
   console.log(`-> Auto-Healer Strategy: ${heal2.strategy}`);
   console.log(`-> Auto-Healer Message to User: ${heal2.userMessage}`);
 }
@@ -123,7 +123,7 @@ async function runTest3() {
 
 async function runTest4() {
   section("Test 4: Memory & Context (RAG Extraction)");
-  
+
   const ticketId = "TKT-TEST4";
   dealPhaseManager.initDeal(ticketId, "Buyer", "Seller");
 
@@ -139,11 +139,11 @@ async function runTest4() {
 
   for (const act of conversation) {
     console.log(`[${act.s}]: ${act.m}`);
-    vectorMemoryStore.addMemory(ticketId, act.s, act.m, "USER");
+    vectorMemoryStore.storeMemory({ ticketId, content: `[${act.s}]: ${act.m}` });
   }
 
   console.log(`\n-> Feeding final message to NLP parser to see if LLM remembers the dynamic 0.5 SOL context...`);
-  
+
   const result = await analyzeMessage(conversation[6].m, "Buyer", ticketId, {
     price: null, collateral_buyer: null, collateral_seller: null,
     agreement_score: 50, both_parties_present: true, price_converged: false, message_count: 7, last_sender: "Buyer"
