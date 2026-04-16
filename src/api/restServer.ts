@@ -30,6 +30,7 @@ import * as taskPipeline from '../services/taskPipeline';
 import { analyzeImage } from '../services/visionEngine';
 import { generateImage } from '../services/imageGenerator';
 import * as scheduler from '../services/schedulerService';
+import { autonomy } from '../services/autonomyConfig';
 
 let server: any;
 
@@ -1531,6 +1532,28 @@ export function startRestApi(port: number = parseInt(process.env.API_PORT || "80
 
     app.delete('/v1/routines/:id', async (req: any, res: any) => {
         res.json({ success: scheduler.deleteRoutine(req.params.id) });
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    // AUTONOMY CONFIG (experiment monitor)
+    // ═══════════════════════════════════════════════════════════
+
+    app.get('/v1/autonomy', async (_req: any, res: any) => {
+        res.json({ success: true, data: autonomy.getState() });
+    });
+
+    app.get('/v1/autonomy/summary', async (_req: any, res: any) => {
+        res.json({ success: true, data: autonomy.getSelfAwarenessSummary() });
+    });
+
+    app.get('/v1/autonomy/log', async (req: any, res: any) => {
+        const limit = parseInt(req.query.limit || '50', 10);
+        res.json({ success: true, data: autonomy.getModLog(limit) });
+    });
+
+    app.post('/v1/autonomy/reset', async (_req: any, res: any) => {
+        autonomy.reset();
+        res.json({ success: true, message: 'Autonomy reset to defaults' });
     });
 
     // Start price oracle background refresh

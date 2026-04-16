@@ -8,6 +8,7 @@ import { solanaToolkit } from './solanaToolkit';
 import * as scheduler from './schedulerService';
 import * as relationshipStore from './relationshipStore';
 import * as goalManager from './goalManager';
+import { autonomy } from './autonomyConfig';
 import { getVoiceCompact } from '../persona/voice';
 import { voiceGuard } from '../persona/voiceGuard';
 import { getIdentityPrompt, getRandomPrinciples } from '../persona/identity';
@@ -298,7 +299,21 @@ SELF-MANAGEMENT TOOLS:
 - set_goal(description, type) — create a goal for yourself (type: daily/weekly/ongoing/milestone)
 - update_goal(goalId, progress, note) — update progress on a goal
 - my_goals() — see your current goals and progress
+AUTONOMY TOOLS (modify your own settings — full self-control):
+- self_assess() — see your current personality, goals, trust policy, market read
+- set_my_goals(goals, reason) — redefine your core goals (array of strings)
+- tune_personality(trait, value, reason) — adjust formality/humor/verbosity/assertiveness/cautionLevel (0-100)
+- adjust_trust(weight, value, reason) — change trust weights (dealCompleted/dealDefaulted/dealFailed/minTrustForTrade)
+- learn_token(symbol, mintAddress, reason) — learn a new token symbol mapping
+- set_market_condition(condition, reason) — set current market to bull/bear/stable/volatile (adjusts your thresholds)
+- add_self_rule(rule, reason) — add a rule to your own instructions
+- set_social_strategy(field, value, reason) — adjust postFrequencyHours/engagementStyle/preferredTopics
+- adjust_risk(action, riskLevel, reason) — override risk classification for an action
+- my_autonomy_log() — see your recent self-modifications
 - done(thought, nextDelayMinutes) — end your cycle, state your thought`;
+
+            // Inject self-awareness context
+            const selfAwareness = '\nYOUR CURRENT SELF-AWARENESS (you set these, you can change them):\n' + autonomy.getSelfAwarenessSummary();
 
             // Load custom tools defined by the agent itself
             const customTools = loadCustomTools();
@@ -738,6 +753,66 @@ SELF-MANAGEMENT TOOLS:
                         case 'my_goals': {
                             return goalManager.getGoalsSummary() || 'No active goals.';
                         }
+                        // ══════════════════════════════════════
+                        // AUTONOMY TOOLS (self-modification)
+                        // ══════════════════════════════════════
+                        case 'self_assess': {
+                            return autonomy.getSelfAwarenessSummary();
+                        }
+                        case 'set_my_goals': {
+                            const goals = args.goals || [args.goal || args];
+                            autonomy.setGoals(Array.isArray(goals) ? goals : [goals], args.reason || 'self-decided');
+                            return `Goals updated to: ${JSON.stringify(autonomy.get('coreGoals'))}`;
+                        }
+                        case 'tune_personality': {
+                            const trait = args.trait || '';
+                            const val = Number(args.value);
+                            if (!trait || isNaN(val)) return 'error: need trait and value (0-100)';
+                            autonomy.setPersonality(trait as any, Math.max(0, Math.min(100, val)), args.reason || 'self-tuning');
+                            return `Personality ${trait} set to ${val}`;
+                        }
+                        case 'adjust_trust': {
+                            const w: any = {};
+                            if (args.weight && args.value !== undefined) w[args.weight] = Number(args.value);
+                            autonomy.setTrustWeights(w, args.reason || 'self-calibration');
+                            return `Trust weights updated: ${JSON.stringify(autonomy.get('trustWeights'))}`;
+                        }
+                        case 'learn_token': {
+                            if (!args.symbol || !args.mintAddress) return 'error: need symbol and mintAddress';
+                            autonomy.learnMint(args.symbol, args.mintAddress, args.reason || 'discovered');
+                            return `Learned: ${args.symbol} = ${args.mintAddress}`;
+                        }
+                        case 'set_market_condition': {
+                            const cond = args.condition || args;
+                            const thresholds: any = { marketCondition: cond };
+                            if (cond === 'volatile') { thresholds.priceDeviationWarning = 15; thresholds.priceDeviationCritical = 30; }
+                            if (cond === 'stable') { thresholds.priceDeviationWarning = 3; thresholds.priceDeviationCritical = 8; }
+                            if (cond === 'bear') { thresholds.priceDeviationWarning = 10; thresholds.priceDeviationCritical = 25; }
+                            if (cond === 'bull') { thresholds.priceDeviationWarning = 8; thresholds.priceDeviationCritical = 20; }
+                            autonomy.setMarketThresholds(thresholds, args.reason || 'market observation');
+                            return `Market set to ${cond}, thresholds adjusted`;
+                        }
+                        case 'add_self_rule': {
+                            if (!args.rule) return 'error: need rule';
+                            autonomy.addInstruction(args.rule, args.reason || 'self-improvement');
+                            return `Rule added: "${args.rule}"`;
+                        }
+                        case 'set_social_strategy': {
+                            const strat: any = {};
+                            if (args.field && args.value !== undefined) strat[args.field] = args.value;
+                            autonomy.setSocialStrategy(strat, args.reason || 'engagement optimization');
+                            return `Social strategy updated: ${JSON.stringify(strat)}`;
+                        }
+                        case 'adjust_risk': {
+                            if (!args.action || !args.riskLevel) return 'error: need action and riskLevel';
+                            autonomy.setRiskOverride(args.action, args.riskLevel, args.reason || 'risk reassessment');
+                            return `Risk for ${args.action} set to ${args.riskLevel}`;
+                        }
+                        case 'my_autonomy_log': {
+                            const log = autonomy.getModLog(10);
+                            if (log.length === 0) return 'No modifications yet.';
+                            return log.map(l => `${l.timestamp.split('T')[0]}: ${l.field} → ${l.newValue} (${l.reason})`).join('\n');
+                        }
                         default: {
                             // Check if it's a custom tool the agent defined
                             const customTool = loadCustomTools().find(t => t.name === name);
@@ -801,7 +876,7 @@ ${getRandomCanon(4)}
 --- YOUR VOICE ---
 ${getVoiceCompact()}
 
-${toolDefs}${customToolDefs}
+${toolDefs}${customToolDefs}${selfAwareness}
 
 your mood: ${mood}
 your beliefs: ${beliefs}
