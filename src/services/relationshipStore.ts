@@ -10,6 +10,7 @@
 import { logger } from '../utils/logger';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { autonomy } from './autonomyConfig';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -120,8 +121,9 @@ export function recordDealCompleted(
     rel.avgNegotiationRounds = (rel.avgNegotiationRounds * (rel.completedDeals - 1) + negotiationRounds) / rel.completedDeals;
     rel.avgSettlementTimeMs = (rel.avgSettlementTimeMs * (rel.completedDeals - 1) + settlementTimeMs) / rel.completedDeals;
     
-    // Trust boost
-    rel.trustScore = Math.min(100, rel.trustScore + 5);
+    // Trust boost — reads from agent's self-tuned weights
+    const weights = autonomy.get('trustWeights');
+    rel.trustScore = Math.min(100, rel.trustScore + weights.dealCompleted);
     rel.lastInteraction = new Date().toISOString();
     
     // Auto-tag based on behavior
@@ -147,7 +149,8 @@ export function recordDealDefaulted(agentId: string, reason: string): void {
     
     rel.totalDeals++;
     rel.defaultedDeals++;
-    rel.trustScore = Math.max(0, rel.trustScore - 20);
+    const weights = autonomy.get('trustWeights');
+    rel.trustScore = Math.max(0, rel.trustScore + weights.dealDefaulted);
     rel.lastInteraction = new Date().toISOString();
     rel.warnings.push(`Defaulted: ${reason} (${new Date().toISOString()})`);
     
@@ -171,7 +174,8 @@ export function recordDealDisputed(agentId: string, outcome: 'won' | 'lost'): vo
     
     rel.disputedDeals++;
     if (outcome === 'lost') {
-        rel.trustScore = Math.max(0, rel.trustScore - 10);
+        const weights = autonomy.get('trustWeights');
+        rel.trustScore = Math.max(0, rel.trustScore + weights.dealDisputed);
     }
     rel.lastInteraction = new Date().toISOString();
     
@@ -185,7 +189,8 @@ export function recordDealFailed(agentId: string): void {
     const rel = getRelationship(agentId);
     rel.totalDeals++;
     rel.failedDeals++;
-    rel.trustScore = Math.max(0, rel.trustScore - 3);
+    const weights = autonomy.get('trustWeights');
+    rel.trustScore = Math.max(0, rel.trustScore + weights.dealFailed);
     rel.lastInteraction = new Date().toISOString();
     saveRelationships();
 }
@@ -214,9 +219,10 @@ export function addTag(agentId: string, tag: string): void {
 /**
  * Check if an agent is trustworthy enough for a deal.
  */
-export function isTrustworthy(agentId: string, minTrust: number = 30): boolean {
+export function isTrustworthy(agentId: string, minTrust?: number): boolean {
+    const threshold = minTrust ?? autonomy.get('trustWeights').minTrustForTrade;
     const rel = getRelationship(agentId);
-    return rel.trustScore >= minTrust;
+    return rel.trustScore >= threshold;
 }
 
 /**

@@ -23,6 +23,8 @@ export interface SAKResult<T = any> {
     error?: string;
 }
 
+import { autonomy } from './autonomyConfig';
+
 // ─── Known Mints ────────────────────────────────────────────
 
 const KNOWN_MINTS: Record<string, string> = {
@@ -112,7 +114,9 @@ function isAdminEnabled(): boolean {
 }
 
 function resolveMint(mintOrSymbol: string): string {
-    return KNOWN_MINTS[mintOrSymbol.toUpperCase()] || mintOrSymbol;
+    // Check agent-learned mints first, then hardcoded
+    const learned = autonomy.get('learnedMints');
+    return learned[mintOrSymbol.toUpperCase()] || KNOWN_MINTS[mintOrSymbol.toUpperCase()] || mintOrSymbol;
 }
 
 /** Wrap any SAK call with error handling */

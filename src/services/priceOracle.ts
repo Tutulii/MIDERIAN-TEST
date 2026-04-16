@@ -14,6 +14,7 @@
 
 import { logger } from "../utils/logger";
 import { loadConfig } from "../config";
+import { autonomy } from "../services/autonomyConfig";
 
 // ==========================================
 // TYPES
@@ -217,7 +218,7 @@ export async function checkPriceDeviation(
 
     return {
         deviationPercent,
-        isFair: Math.abs(deviationPercent) <= 20, // ±20% is considered fair for OTC
+        isFair: Math.abs(deviationPercent) <= autonomy.get('marketThresholds').priceDeviationCritical,
         marketPriceSol,
     };
 }

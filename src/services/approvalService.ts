@@ -11,7 +11,7 @@
  */
 
 import { logger } from '../utils/logger';
-
+import { autonomy } from './autonomyConfig';
 import { randomUUID } from 'crypto';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -90,6 +90,9 @@ const ACTION_RISK_MAP: Record<string, RiskLevel> = {
 };
 
 export function classifyRisk(action: string): RiskLevel {
+    // Agent's own risk overrides take priority
+    const overrides = autonomy.get('riskOverrides');
+    if (overrides[action]) return overrides[action] as RiskLevel;
     return ACTION_RISK_MAP[action] || 'medium';
 }
 
@@ -121,7 +124,8 @@ export async function requestApproval(
 
     // Threshold mode: auto-approve below threshold
     if (mode === 'threshold' && estimatedValueUSD !== undefined) {
-        if (estimatedValueUSD <= getThresholdUSD()) {
+        const threshold = autonomy.get('autoApproveMaxUSD');
+        if (estimatedValueUSD <= threshold) {
             logger.debug('approval_threshold_auto', { action, value: estimatedValueUSD });
             return true;
         }
